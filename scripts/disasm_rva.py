@@ -3,25 +3,44 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import pefile
-from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+try:
+    from .inspect_common import (
+        ModuleInfo,
+        build_capture_window,
+        disassemble_window,
+        format_hex,
+        parse_int,
+        require_capstone,
+        validate_window_request,
+    )
+except ImportError:
+    from inspect_common import (
+        ModuleInfo,
+        build_capture_window,
+        disassemble_window,
+        format_hex,
+        parse_int,
+        require_capstone,
+        validate_window_request,
+    )
 
 
-def parse_int(value: str) -> int:
-    return int(value, 0)
+def require_pefile() -> object:
+    try:
+        import pefile
+    except (ModuleNotFoundError, ImportError) as exc:
+        raise SystemExit(
+            "Missing dependency 'pefile'. Run .\\setup.ps1 or install requirements.txt into the active environment."
+        ) from exc
+    return pefile
 
 
-def format_bytes(data: bytes) -> str:
-    return " ".join(f"{byte:02X}" for byte in data)
-
-
-def resolve_rva(pe: pefile.PE, rva: int) -> tuple[int, pefile.SectionStructure]:
+def resolve_section(pe: object, rva: int) -> object:
     for section in pe.sections:
         start = section.VirtualAddress
         end = start + max(section.Misc_VirtualSize, section.SizeOfRawData)
         if start <= rva < end:
-            offset = section.PointerToRawData + (rva - start)
-            return offset, section
+            return section
     raise ValueError(f"RVA 0x{rva:X} is not inside a mapped section")
 
 
@@ -40,40 +59,50 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
+    validate_window_request(args.before, args.after)
+    pefile = require_pefile()
+    require_capstone()
+
     exe_path = Path(args.exe)
-    pe = pefile.PE(str(exe_path), fast_load=False)
+    try:
+        pe = pefile.PE(str(exe_path), fast_load=False)
+    except (OSError, pefile.PEFormatError) as exc:
+        raise SystemExit(f"Failed to open PE '{exe_path}': {exc}") from exc
     image_base = pe.OPTIONAL_HEADER.ImageBase
+    size_of_image = pe.OPTIONAL_HEADER.SizeOfImage
     target_rva = args.rva if args.rva is not None else args.va - image_base
 
-    file_offset, section = resolve_rva(pe, target_rva)
-    window_start_rva = max(0, target_rva - args.before)
-    window_end_rva = target_rva + args.after
-    window_offset, _ = resolve_rva(pe, window_start_rva)
-    window_size = window_end_rva - window_start_rva
+    module = ModuleInfo(
+        name=exe_path.name,
+        path=str(exe_path.resolve()),
+        base_address=image_base,
+        size=size_of_image,
+    )
+    window = build_capture_window(module, target_rva, args.before, args.after)
+    try:
+        section = resolve_section(pe, window.target_rva)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
-    with exe_path.open("rb") as handle:
-        handle.seek(window_offset)
-        blob = handle.read(window_size)
-
-    md = Cs(CS_ARCH_X86, CS_MODE_64)
-    md.detail = False
-    md.skipdata = True
+    blob = pe.get_memory_mapped_image()[window.start_rva : window.end_rva_exclusive]
+    if len(blob) != window.size:
+        raise SystemExit(
+            f"Failed to read full PE window at {format_hex(window.start_rva)} size {format_hex(window.size)}"
+        )
 
     print(f"file      : {exe_path}")
-    print(f"image base: 0x{image_base:X}")
+    print(f"image base: {format_hex(image_base)}")
     section_name = bytes(section.Name).split(b"\x00", 1)[0].decode(errors="replace")
     print(f"section   : {section_name}")
-    print(f"target rva: 0x{target_rva:X}")
-    print(f"target va : 0x{image_base + target_rva:X}")
-    print(f"file offs : 0x{file_offset:X}")
+    print(f"target rva: {format_hex(window.target_rva)}")
+    print(f"target va : {format_hex(window.target_va)}")
     print()
 
-    target_va = image_base + target_rva
-    for insn in md.disasm(blob, image_base + window_start_rva):
-        marker = ">>" if insn.address == target_va else "  "
-        if insn.address < target_va < insn.address + insn.size:
-            marker = "*>"
-        print(f"{marker} {insn.address:016X}  {format_bytes(insn.bytes):<32} {insn.mnemonic} {insn.op_str}".rstrip())
+    for line in disassemble_window(blob, window.start_va, window.target_va):
+        print(
+            f"{line.marker} {line.address:016X}  "
+            f"{line.bytes_hex:<32} {line.mnemonic} {line.op_str}".rstrip()
+        )
 
     return 0
 

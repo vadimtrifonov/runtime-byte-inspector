@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "description": "Seeded Skyrim VR node-site candidates for live-process evidence capture.",
+  "candidates": [
+    {
+      "label": "current_1D7B6B",
+      "rva": "0x1D7B6B",
+      "group": "current_validated",
+      "notes": "Current validated VR site."
+    },
+    {
+      "label": "current_1D7B84",
+      "rva": "0x1D7B84",
+      "group": "current_validated",
+      "notes": "Current validated VR site."
+    },
+    {
+      "label": "current_1D8F40",
+      "rva": "0x1D8F40",
+      "group": "current_validated",
+      "notes": "Current validated VR site."
+    },
+    {
+      "label": "current_1D9605",
+      "rva": "0x1D9605",
+      "group": "current_validated",
+      "notes": "Current validated VR site."
+    },
+    {
+      "label": "current_1D9B3F",
+      "rva": "0x1D9B3F",
+      "group": "current_validated",
+      "notes": "Current validated VR site."
+    },
+    {
+      "label": "current_1DA6B6",
+      "rva": "0x1DA6B6",
+      "group": "current_validated",
+      "notes": "Current validated VR site."
+    },
+    {
+      "label": "discarded_1D7B4B",
+      "rva": "0x1D7B4B",
+      "group": "discarded_guess",
+      "notes": "Discarded current-repo guess."
+    },
+    {
+      "label": "discarded_1D7B64",
+      "rva": "0x1D7B64",
+      "group": "discarded_guess",
+      "notes": "Discarded current-repo guess."
+    },
+    {
+      "label": "discarded_1D8EB3",
+      "rva": "0x1D8EB3",
+      "group": "discarded_guess",
+      "notes": "Discarded current-repo guess."
+    },
+    {
+      "label": "discarded_1D9B33",
+      "rva": "0x1D9B33",
+      "group": "discarded_guess",
+      "notes": "Discarded current-repo guess."
+    },
+    {
+      "label": "legacy_1D7B6B",
+      "rva": "0x1D7B6B",
+      "group": "legacy_ng",
+      "notes": "Original NG-era VR patch address."
+    },
+    {
+      "label": "legacy_1D7B81",
+      "rva": "0x1D7B81",
+      "group": "legacy_ng",
+      "notes": "Original NG-era VR patch address."
+    },
+    {
+      "label": "legacy_1D8F49",
+      "rva": "0x1D8F49",
+      "group": "legacy_ng",
+      "notes": "Original NG-era VR patch address."
+    },
+    {
+      "label": "legacy_1D960E",
+      "rva": "0x1D960E",
+      "group": "legacy_ng",
+      "notes": "Original NG-era VR patch address."
+    },
+    {
+      "label": "legacy_1D9B48",
+      "rva": "0x1D9B48",
+      "group": "legacy_ng",
+      "notes": "Original NG-era VR patch address."
+    },
+    {
+      "label": "legacy_1DA6B6",
+      "rva": "0x1DA6B6",
+      "group": "legacy_ng",
+      "notes": "Original NG-era VR patch address."
+    }
+  ]
+}

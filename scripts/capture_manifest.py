@@ -65,8 +65,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--before", type=parse_int, default=32, help="Bytes to include before each target")
     parser.add_argument("--after", type=parse_int, default=64, help="Bytes to include after each target")
-    parser.add_argument("--output-dir", default="evidence", help="Directory where JSON evidence bundles are written")
-    parser.add_argument("--output-name", help="Optional output filename for the evidence bundle")
+    parser.add_argument(
+        "--output-path",
+        help="Optional output path for the evidence bundle. Defaults under evidence\\ when omitted",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Allow overwriting an existing output file")
     return parser
 
@@ -180,16 +182,15 @@ def manifest_slug(path: Path) -> str:
 
 
 def build_output_path(
-    output_dir: Path,
-    output_name: str | None,
+    output_path: str | None,
     timestamp: str,
     process_state: str,
     pid: int,
     manifest_path: Path,
 ) -> Path:
-    if output_name is not None:
-        return output_dir / output_name
-    return output_dir / (
+    if output_path is not None:
+        return Path(output_path)
+    return Path("evidence") / (
         f"capture_{compact_timestamp(timestamp)}_{process_state}_pid{pid}_{manifest_slug(manifest_path)}.json"
     )
 
@@ -251,10 +252,8 @@ def main() -> int:
     require_capstone()
     process, module = resolve_process_and_module(args.process, args.module, args.pid)
     timestamp = utc_timestamp()
-    output_dir = Path(args.output_dir)
     output_path = build_output_path(
-        output_dir,
-        args.output_name,
+        args.output_path,
         timestamp,
         args.process_state,
         process.pid,
@@ -304,8 +303,7 @@ def main() -> int:
 
             try:
                 window = build_capture_window(module, candidate.rva, args.before, args.after)
-                result["target_va"] = format_hex(window.target_va)
-                result["window"] = {
+                window_payload = {
                     "start_rva": format_hex(window.start_rva),
                     "start_va": format_hex(window.start_va),
                     "end_rva_exclusive": format_hex(window.end_rva_exclusive),
@@ -317,10 +315,13 @@ def main() -> int:
                     "size": window.size,
                 }
                 blob = read_process_bytes_from_handle(process_handle, window.start_va, window.size)
+                disassembly = disassembly_to_jsonable(disassemble_window(blob, window.start_va, window.target_va))
+                result["target_va"] = format_hex(window.target_va)
+                result["window"] = window_payload
                 result["status"] = "ok"
                 result["raw_bytes_hex"] = blob.hex().upper()
                 result["raw_bytes_len"] = len(blob)
-                result["disassembly"] = disassembly_to_jsonable(disassemble_window(blob, window.start_va, window.target_va))
+                result["disassembly"] = disassembly
                 ok_count += 1
             except SystemExit as exc:
                 result["status"] = "error"

@@ -1,118 +1,79 @@
 from __future__ import annotations
 
-"""Compare saved evidence bundles for current-versus-legacy Skyrim VR candidates.
-
-Assumptions kept intentionally loose for capture-side compatibility:
-- Input JSON may be a single bundle object, a top-level list, or a container under
-  `bundles`, `evidence`, `records`, `items`, or `candidates`.
-- Candidate identity is discovered from common fields such as `label`, `group`,
-  `target_rva`, `target_va`, `raw_bytes_hex`, and `disassembly`, including simple
-  nested forms like `candidate.label` or `window.bytes_hex`.
-- Relationship classification is review-oriented. It summarizes likely pairings but
-  does not decide the final runtime patch table on its own.
-"""
+"""Compare the comparison-required subset of workspace evidence bundles."""
 
 import argparse
 import json
 import math
 import re
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 
-CURRENT_GROUP_KIND = "current"
-LEGACY_GROUP_KIND = "legacy"
-DISCARDED_GROUP_KIND = "discarded"
-OTHER_GROUP_KIND = "other"
-WRAPPER_KEYS = ("bundles", "evidence", "records", "items", "candidates")
-RECORD_ADDRESS_PATHS = (
-    "target_rva",
-    "rva",
-    "target.rva",
-    "candidate.rva",
-    "provenance.target_rva",
-    "target_va",
-    "va",
-    "target.va",
-    "candidate.va",
-    "provenance.target_va",
-)
-RECORD_EVIDENCE_PATHS = (
-    "raw_bytes",
-    "raw_bytes_hex",
-    "bytes",
-    "bytes_hex",
-    "window.bytes",
-    "window.bytes_hex",
-    "capture.raw_bytes",
-    "capture.raw_bytes_hex",
-    "disassembly",
-    "window.disassembly",
-    "capture.disassembly",
-    "instructions",
-    "window.instructions",
-)
-
-GROUP_KIND_ALIASES = {
-    CURRENT_GROUP_KIND: {
-        "current",
-        "currentvalidated",
-        "currentvalidatedvrsites",
-        "validated",
-        "validatedcurrent",
-        "validatedvrsites",
-    },
-    LEGACY_GROUP_KIND: {
-        "legacy",
-        "legacyng",
-        "legacyngera",
-        "ng",
-        "ngera",
-        "originalngera",
-        "originalngeravrpatchaddresses",
-    },
-    DISCARDED_GROUP_KIND: {
-        "discarded",
-        "discardedcurrentrepoguesses",
-        "discardedguess",
-        "discardedguesses",
-    },
-}
-
-HEX_TOKEN_RE = re.compile(r"[0-9A-Fa-f]{2}")
+VALID_GROUPS = ("current_validated", "legacy_ng", "discarded_guess")
+VALID_PROCESS_STATES = frozenset({"unpatched", "patched", "unknown"})
+VALID_ERROR_KINDS = frozenset({"validation", "operational", "internal"})
 
 
 @dataclass(frozen=True)
-class EvidenceRecord:
+class BundleMeta:
+    source_path: str
+    capture_timestamp: str
+    capture_mode: str
+    process_state: str
+    process_name: str
+    pid: int
+    module_path: str
+    module_base: int
+
+
+@dataclass(frozen=True)
+class CandidateRecord:
     source_path: str
     source_index: int
     label: str
     label_key: str
+    label_address_key: str | None
     group: str
-    group_kind: str
     notes: str | None
-    capture_timestamp: str | None
-    capture_mode: str | None
-    process_state: str | None
-    process_name: str | None
-    pid: int | None
-    module_path: str | None
-    module_base: int | None
-    target_rva: int | None
+    capture_timestamp: str
+    capture_mode: str
+    process_state: str
+    process_name: str
+    pid: int
+    module_path: str
+    module_base: int
+    target_rva: int
     target_va: int | None
-    before: int | None
-    after: int | None
-    raw_bytes: bytes | None
-    raw_bytes_hex: str | None
-    disassembly_text: str | None
+
+
+@dataclass(frozen=True)
+class EvidenceRecord(CandidateRecord):
+    before: int
+    after: int
+    raw_bytes: bytes
+    raw_bytes_hex: str
+
+
+@dataclass(frozen=True)
+class CaptureFailureRecord(CandidateRecord):
+    status: str
+    error_kind: str
+    error_message: str
+    error_traceback: str | None
+    error_code: str | None
+    error_payload_json: str
+
+
+ComparisonRecord = EvidenceRecord | CaptureFailureRecord
 
 
 @dataclass(frozen=True)
 class Pairing:
-    current: EvidenceRecord
-    legacy: EvidenceRecord | None
+    current: ComparisonRecord
+    legacy: ComparisonRecord
     relation: str
     score: float
     best_shift: int | None
@@ -126,31 +87,34 @@ class SkippedInput:
     reason: str
 
 
+class BundleParseError(ValueError):
+    """Raised when a bundle does not match the workspace schema."""
+
+
 class RecordParseError(ValueError):
-    """Raised when a record-like payload contains an invalid field value."""
+    """Raised when a result entry does not match the workspace schema."""
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Compare saved evidence bundles from disk and summarize current-versus-legacy "
-            "candidate relationships for review."
-        )
+        description="Compare the comparison-required subset of workspace evidence bundles"
     )
     parser.add_argument(
         "inputs",
         nargs="+",
-        help="One or more JSON evidence bundle files or directories containing JSON bundles",
+        help="One or more JSON evidence bundle files or directories containing bundle files",
     )
     parser.add_argument(
         "--current-group",
-        default=CURRENT_GROUP_KIND,
-        help="Group kind or literal group name to treat as the current candidate set (default: current)",
+        choices=VALID_GROUPS,
+        default="current_validated",
+        help="Workspace group to treat as the current candidate set",
     )
     parser.add_argument(
         "--legacy-group",
-        default=LEGACY_GROUP_KIND,
-        help="Group kind or literal group name to treat as the legacy candidate set (default: legacy)",
+        choices=VALID_GROUPS,
+        default="legacy_ng",
+        help="Workspace group to treat as the legacy candidate set",
     )
     parser.add_argument(
         "--format",
@@ -188,14 +152,20 @@ def main() -> int:
 
     records, skipped_inputs = load_records(bundle_paths)
     if not records:
-        raise SystemExit("No evidence records were found in the provided JSON bundles")
+        if skipped_inputs:
+            if args.format == "json":
+                json.dump(build_no_records_payload(bundle_paths, skipped_inputs), sys.stdout, indent=2, sort_keys=True)
+                sys.stdout.write("\n")
+                return 1
+            raise SystemExit(render_no_records_message(skipped_inputs))
+        raise SystemExit("No workspace evidence records were found in the provided JSON bundles")
 
     current_records = select_group(records, args.current_group)
     legacy_records = select_group(records, args.legacy_group)
     if not current_records:
-        raise SystemExit(f"No records matched current group selector '{args.current_group}'")
+        raise SystemExit(f"No records matched current group '{args.current_group}'")
     if not legacy_records:
-        raise SystemExit(f"No records matched legacy group selector '{args.legacy_group}'")
+        raise SystemExit(f"No records matched legacy group '{args.legacy_group}'")
 
     pairings, unmatched_current, unmatched_legacy = build_pairings(
         current_records=current_records,
@@ -248,9 +218,10 @@ def discover_bundle_paths(raw_inputs: Iterable[str]) -> list[Path]:
     return sorted(bundle_paths)
 
 
-def load_records(bundle_paths: Iterable[Path]) -> tuple[list[EvidenceRecord], list[SkippedInput]]:
-    records: list[EvidenceRecord] = []
+def load_records(bundle_paths: Iterable[Path]) -> tuple[list[ComparisonRecord], list[SkippedInput]]:
+    records: list[ComparisonRecord] = []
     skipped_inputs: list[SkippedInput] = []
+
     for bundle_path in bundle_paths:
         try:
             with bundle_path.open("r", encoding="utf-8") as handle:
@@ -280,184 +251,180 @@ def load_records(bundle_paths: Iterable[Path]) -> tuple[list[EvidenceRecord], li
             )
             continue
 
-        entries, skip_reason = iter_bundle_entries(payload)
-        if skip_reason is not None:
-            skipped_inputs.append(SkippedInput(source_path=str(bundle_path), reason=skip_reason))
+        try:
+            bundle_meta, results = load_bundle(bundle_path, payload)
+        except BundleParseError as exc:
+            skipped_inputs.append(
+                SkippedInput(
+                    source_path=str(bundle_path),
+                    reason=f"Bundle schema error: {exc}",
+                )
+            )
             continue
-        for source_index, entry in enumerate(entries):
-            if not isinstance(entry, dict):
-                continue
+
+        for source_index, result in enumerate(results):
             try:
-                records.append(build_record(bundle_path, source_index, entry))
+                records.append(parse_result(bundle_meta, source_index, result))
             except RecordParseError as exc:
+                label_hint = result_label_hint(result, source_index)
                 skipped_inputs.append(
                     SkippedInput(
                         source_path=str(bundle_path),
-                        reason=f"Record {source_index}: {exc}",
+                        reason=f"Result {source_index} ({label_hint}): {exc}",
                     )
                 )
+
     return records, skipped_inputs
 
 
-def iter_bundle_entries(payload: Any) -> tuple[list[dict[str, Any]], str | None]:
-    if isinstance(payload, list):
-        entries = [item for item in payload if isinstance(item, dict) and is_probable_evidence_record(item)]
-        if entries or not payload:
-            return entries, None
-        return [], "Top-level JSON list does not contain evidence records"
-    if not isinstance(payload, dict):
-        return [], "Top-level JSON must be an object or list"
+def load_bundle(bundle_path: Path, payload: Any) -> tuple[BundleMeta, list[Any]]:
+    root = require_mapping(payload, "top-level JSON")
+    capture_timestamp = require_bundle_string(root, "capture_timestamp")
+    capture_mode = require_bundle_string(root, "capture_mode")
+    if capture_mode != "live_process":
+        raise BundleParseError(f"field 'capture_mode' must be 'live_process', got {capture_mode!r}")
 
-    saw_empty_wrapper = False
-    last_wrapper_skip_reason: str | None = None
-    for key in WRAPPER_KEYS:
-        value = payload.get(key)
-        if not isinstance(value, list):
-            continue
-        if not value:
-            saw_empty_wrapper = True
-            continue
+    process_state = require_bundle_string(root, "process_state")
+    if process_state not in VALID_PROCESS_STATES:
+        expected = ", ".join(sorted(VALID_PROCESS_STATES))
+        raise BundleParseError(f"field 'process_state' must be one of: {expected}")
 
-        parent_context = {name: item for name, item in payload.items() if name not in WRAPPER_KEYS}
-        entries = [
-            merge_parent_context(parent_context, item)
-            for item in value
-            if isinstance(item, dict)
-        ]
-        entries = [entry for entry in entries if is_probable_evidence_record(entry)]
-        if entries:
-            return entries, None
-        last_wrapper_skip_reason = f"Wrapper '{key}' does not contain evidence records"
+    process = require_mapping_field(root, "process")
+    process_name = require_bundle_string(process, "name", "process.name")
+    pid = require_bundle_int(process, "pid", "process.pid")
+    if pid <= 0:
+        raise BundleParseError(f"field 'process.pid' must be positive, got {pid!r}")
 
-    if last_wrapper_skip_reason is not None:
-        return [], last_wrapper_skip_reason
-    if saw_empty_wrapper:
-        return [], None
+    module = require_mapping_field(root, "module")
+    module_path = require_bundle_string(module, "path", "module.path")
+    module_base = require_bundle_int(module, "base_address", "module.base_address")
 
-    if is_probable_evidence_record(payload):
-        return [payload], None
-    return [], "Top-level JSON object does not look like an evidence bundle"
+    window = require_mapping_field(root, "window")
+    require_bundle_int(window, "before", "window.before")
+    require_bundle_int(window, "after", "window.after")
 
+    results = require_list(root, "results")
 
-def build_record(bundle_path: Path, source_index: int, payload: dict[str, Any]) -> EvidenceRecord:
-    label = stringify(
-        first_value(
-            payload,
-            "label",
-            "name",
-            "candidate.label",
-            "candidate.name",
-            "target.label",
-            default=f"{bundle_path.stem}#{source_index}",
-        )
-    )
-    group = stringify(
-        first_value(
-            payload,
-            "group",
-            "candidate.group",
-            "target.group",
-            default="unknown",
-        )
-    )
-    label_key = normalize_token(label)
-    group_kind = classify_group(group)
-
-    module_base = parse_int_field(
-        payload,
-        "module base",
-        "module_base",
-        "module.base_address",
-        "provenance.module_base_address",
-    )
-    target_rva = parse_int_field(
-        payload,
-        "target RVA",
-        "target_rva",
-        "rva",
-        "target.rva",
-        "candidate.rva",
-        "provenance.target_rva",
-    )
-    target_va = parse_int_field(
-        payload,
-        "target VA",
-        "target_va",
-        "va",
-        "target.va",
-        "candidate.va",
-        "provenance.target_va",
-    )
-    if target_rva is None and target_va is not None and module_base is not None:
-        target_rva = target_va - module_base
-
-    raw_bytes = parse_raw_bytes(
-        first_value(
-            payload,
-            "raw_bytes",
-            "raw_bytes_hex",
-            "bytes",
-            "bytes_hex",
-            "window.bytes",
-            "window.bytes_hex",
-            "capture.raw_bytes",
-            "capture.raw_bytes_hex",
-        )
-    )
-
-    return EvidenceRecord(
-        source_path=str(bundle_path),
-        source_index=source_index,
-        label=label,
-        label_key=label_key,
-        group=group,
-        group_kind=group_kind,
-        notes=optional_string(first_value(payload, "notes", "candidate.notes", "target.notes")),
-        capture_timestamp=optional_string(first_value(payload, "capture_timestamp", "timestamp", "captured_at")),
-        capture_mode=optional_string(first_value(payload, "capture_mode", "mode")),
-        process_state=optional_string(first_value(payload, "process_state", "annotation.process_state")),
-        process_name=optional_string(first_value(payload, "process_name", "process.name")),
-        pid=parse_int_field(payload, "PID", "pid", "process.pid"),
-        module_path=optional_string(first_value(payload, "module_path", "module.path")),
-        module_base=module_base,
-        target_rva=target_rva,
-        target_va=target_va,
-        before=parse_int_field(payload, "window.before", "before", "window.before", "window_size.before"),
-        after=parse_int_field(payload, "window.after", "after", "window.after", "window_size.after"),
-        raw_bytes=raw_bytes,
-        raw_bytes_hex=raw_bytes.hex() if raw_bytes is not None else None,
-        disassembly_text=parse_disassembly_text(
-            first_value(
-                payload,
-                "disassembly",
-                "window.disassembly",
-                "capture.disassembly",
-                "instructions",
-                "window.instructions",
-            )
+    return (
+        BundleMeta(
+            source_path=str(bundle_path),
+            capture_timestamp=capture_timestamp,
+            capture_mode=capture_mode,
+            process_state=process_state,
+            process_name=process_name,
+            pid=pid,
+            module_path=module_path,
+            module_base=module_base,
         ),
+        results,
     )
 
 
-def select_group(records: Iterable[EvidenceRecord], selector: str) -> list[EvidenceRecord]:
-    normalized_selector = normalize_token(selector)
-    canonical_selector = canonical_group_kind(selector)
-    matches = [
-        record
-        for record in records
-        if record.group_kind == canonical_selector or normalize_token(record.group) == normalized_selector
-    ]
-    return sorted(matches, key=sort_key)
+def parse_result(bundle_meta: BundleMeta, source_index: int, payload: Any) -> ComparisonRecord:
+    if not isinstance(payload, dict):
+        raise RecordParseError("result must be an object")
+    result = payload
+    label = require_record_string(result, "label")
+    group = require_record_string(result, "group")
+    if group not in VALID_GROUPS:
+        expected = ", ".join(VALID_GROUPS)
+        raise RecordParseError(f"field 'group' must be one of: {expected}")
+
+    notes = optional_string(result.get("notes"), "notes")
+    target_rva = require_record_int(result, "target_rva")
+    target_va = optional_int(result.get("target_va"), "target_va")
+    status = require_record_string(result, "status")
+    if status not in {"ok", "error"}:
+        raise RecordParseError(f"field 'status' must be 'ok' or 'error', got {status!r}")
+
+    common_fields = {
+        "source_path": bundle_meta.source_path,
+        "source_index": source_index,
+        "label": label,
+        "label_key": normalize_token(label),
+        "label_address_key": label_address_suffix(label),
+        "group": group,
+        "notes": notes,
+        "capture_timestamp": bundle_meta.capture_timestamp,
+        "capture_mode": bundle_meta.capture_mode,
+        "process_state": bundle_meta.process_state,
+        "process_name": bundle_meta.process_name,
+        "pid": bundle_meta.pid,
+        "module_path": bundle_meta.module_path,
+        "module_base": bundle_meta.module_base,
+        "target_rva": target_rva,
+        "target_va": target_va,
+    }
+
+    if status == "ok":
+        window = require_record_mapping_field(result, "window")
+        before = require_record_int(window, "actual_before", "window.actual_before")
+        after = require_record_int(window, "actual_after", "window.actual_after")
+        if before < 0 or after < 0:
+            raise RecordParseError("fields 'window.actual_before' and 'window.actual_after' must be non-negative")
+        if "error_kind" in result or "error" in result:
+            raise RecordParseError("status 'ok' result must not include failure fields")
+        raw_bytes_hex = require_record_string(result, "raw_bytes_hex")
+        raw_bytes = parse_raw_bytes_hex(raw_bytes_hex)
+        raw_bytes_len = require_record_int(result, "raw_bytes_len", "raw_bytes_len")
+        if raw_bytes_len != len(raw_bytes):
+            raise RecordParseError(
+                f"field 'raw_bytes_len' does not match decoded raw_bytes_hex length ({raw_bytes_len} != {len(raw_bytes)})"
+            )
+        expected_raw_bytes_len = before + after + 1
+        if expected_raw_bytes_len != raw_bytes_len:
+            raise RecordParseError(
+                "fields 'window.actual_before' and 'window.actual_after' are inconsistent with 'raw_bytes_len' "
+                f"({before} + {after} + 1 != {raw_bytes_len})"
+            )
+        disassembly = result.get("disassembly")
+        if not isinstance(disassembly, list):
+            raise RecordParseError("field 'disassembly' must be a list for status 'ok'")
+        if target_va is None:
+            raise RecordParseError("field 'target_va' is required for status 'ok'")
+        return EvidenceRecord(
+            **common_fields,
+            before=before,
+            after=after,
+            raw_bytes=raw_bytes,
+            raw_bytes_hex=raw_bytes.hex(),
+        )
+
+    error_kind = require_record_string(result, "error_kind")
+    if error_kind not in VALID_ERROR_KINDS:
+        expected = ", ".join(sorted(VALID_ERROR_KINDS))
+        raise RecordParseError(f"field 'error_kind' must be one of: {expected}")
+    error_payload = require_record_mapping_field(result, "error")
+    error_message = require_record_string(error_payload, "message", "error.message")
+    error_traceback = optional_string(error_payload.get("traceback"), "error.traceback")
+    error_code = optional_error_code(error_payload)
+
+    if "raw_bytes_hex" in result or "raw_bytes_len" in result or "disassembly" in result:
+        raise RecordParseError("status 'error' result must not include readable evidence fields")
+
+    return CaptureFailureRecord(
+        **common_fields,
+        status=status,
+        error_kind=error_kind,
+        error_message=error_message,
+        error_traceback=error_traceback,
+        error_code=error_code,
+        error_payload_json=serialize_json(error_payload),
+    )
+
+
+def select_group(records: Iterable[ComparisonRecord], group: str) -> list[ComparisonRecord]:
+    return sorted((record for record in records if record.group == group), key=sort_key)
 
 
 def build_pairings(
     *,
-    current_records: list[EvidenceRecord],
-    legacy_records: list[EvidenceRecord],
+    current_records: list[ComparisonRecord],
+    legacy_records: list[ComparisonRecord],
     min_same_block_score: float,
     min_different_score: float,
     max_anchor_shift: int,
-) -> tuple[list[Pairing], list[EvidenceRecord], list[EvidenceRecord]]:
+) -> tuple[list[Pairing], list[ComparisonRecord], list[ComparisonRecord]]:
     scored_candidates: list[tuple[tuple[float, ...], Pairing]] = []
     for current in current_records:
         for legacy in legacy_records:
@@ -471,16 +438,14 @@ def build_pairings(
                 )
             )
 
-    assigned_current: set[EvidenceRecord] = set()
-    assigned_legacy: set[EvidenceRecord] = set()
+    assigned_current: set[ComparisonRecord] = set()
+    assigned_legacy: set[ComparisonRecord] = set()
     pairings: list[Pairing] = []
     for _, pairing in sorted(scored_candidates, key=lambda item: item[0], reverse=True):
-        current = pairing.current
-        legacy = pairing.legacy
-        if current in assigned_current or legacy in assigned_legacy:
+        if pairing.current in assigned_current or pairing.legacy in assigned_legacy:
             continue
-        assigned_current.add(current)
-        assigned_legacy.add(legacy)
+        assigned_current.add(pairing.current)
+        assigned_legacy.add(pairing.legacy)
         pairings.append(pairing)
 
     pairings.sort(key=lambda pairing: sort_key(pairing.current))
@@ -490,53 +455,42 @@ def build_pairings(
 
 
 def pair_priority(
-    current: EvidenceRecord,
-    legacy: EvidenceRecord,
+    current: ComparisonRecord,
+    legacy: ComparisonRecord,
     score: float,
     best_shift: int | None,
 ) -> tuple[float, ...]:
-    exact_label = 1.0 if current.label_key and current.label_key == legacy.label_key else 0.0
-    partial_label = 1.0 if has_partial_label_match(current.label_key, legacy.label_key) else 0.0
-    rva_delta = None
-    if current.target_rva is not None and legacy.target_rva is not None:
-        rva_delta = current.target_rva - legacy.target_rva
+    rva_delta = current.target_rva - legacy.target_rva
+    same_rva = 1.0 if rva_delta == 0 else 0.0
     shift_agreement = 1.0 if shift_matches_delta(best_shift, rva_delta) else 0.0
-    rva_closeness = 0.0 if rva_delta is None else -float(abs(rva_delta))
-    return (exact_label, shift_agreement, score, partial_label, rva_closeness)
-
-
-def has_partial_label_match(current_label: str, legacy_label: str) -> bool:
-    if not current_label or not legacy_label:
-        return False
-    return current_label in legacy_label or legacy_label in current_label
+    same_label_address = 1.0 if current.label_address_key and current.label_address_key == legacy.label_address_key else 0.0
+    rva_closeness = -float(abs(rva_delta))
+    return (same_rva, shift_agreement, same_label_address, score, rva_closeness)
 
 
 def compare_pair(
-    current: EvidenceRecord,
-    legacy: EvidenceRecord,
+    current: ComparisonRecord,
+    legacy: ComparisonRecord,
     min_same_block_score: float,
     min_different_score: float,
     max_anchor_shift: int,
 ) -> Pairing:
-    score, best_shift, reason = compute_similarity(current, legacy, max_anchor_shift)
-    rva_delta = None
-    if current.target_rva is not None and legacy.target_rva is not None:
-        rva_delta = current.target_rva - legacy.target_rva
-
-    if not is_readable(current) or not is_readable(legacy):
+    if isinstance(current, CaptureFailureRecord) or isinstance(legacy, CaptureFailureRecord):
+        score = 0.0
+        best_shift = None
+        reason = format_unreadable_reason(current, legacy)
         relation = "unreadable"
-    elif current.target_rva == legacy.target_rva and score >= min_same_block_score:
-        relation = "exact_match"
-    elif (
-        best_shift not in (None, 0)
-        and score >= min_same_block_score
-        and shift_matches_delta(best_shift, rva_delta)
-    ):
-        relation = "same_block_shifted_anchor"
-    elif score >= min_different_score:
-        relation = "different_candidate"
     else:
-        relation = "mismatch"
+        score, best_shift, reason = compute_similarity(current, legacy, max_anchor_shift)
+        rva_delta = current.target_rva - legacy.target_rva
+        if current.target_rva == legacy.target_rva and score >= min_same_block_score:
+            relation = "exact_match"
+        elif best_shift not in (None, 0) and score >= min_same_block_score and shift_matches_delta(best_shift, rva_delta):
+            relation = "same_block_shifted_anchor"
+        elif score >= min_different_score:
+            relation = "different_candidate"
+        else:
+            relation = "mismatch"
 
     return Pairing(
         current=current,
@@ -544,7 +498,7 @@ def compare_pair(
         relation=relation,
         score=score,
         best_shift=best_shift,
-        rva_delta=rva_delta,
+        rva_delta=current.target_rva - legacy.target_rva,
         reason=reason,
     )
 
@@ -554,23 +508,15 @@ def has_counterpart_signal(
     min_different_score: float,
     max_anchor_shift: int,
 ) -> bool:
-    current = pairing.current
-    legacy = pairing.legacy
-
-    if current.target_rva is not None and legacy.target_rva is not None:
-        if current.target_rva == legacy.target_rva:
-            return True
-        if (
-            pairing.rva_delta is not None
-            and abs(pairing.rva_delta) <= max_anchor_shift
-            and shift_matches_delta(pairing.best_shift, pairing.rva_delta)
-        ):
-            return True
-
-    if current.label_key and legacy.label_key:
-        if current.label_key == legacy.label_key or has_partial_label_match(current.label_key, legacy.label_key):
-            return True
-
+    if pairing.current.target_rva == pairing.legacy.target_rva:
+        return True
+    if (
+        abs(pairing.rva_delta or 0) <= max_anchor_shift
+        and shift_matches_delta(pairing.best_shift, pairing.rva_delta)
+    ):
+        return True
+    if pairing.current.label_address_key and pairing.current.label_address_key == pairing.legacy.label_address_key:
+        return True
     return pairing.score >= min_different_score
 
 
@@ -578,25 +524,57 @@ def compute_similarity(
     current: EvidenceRecord,
     legacy: EvidenceRecord,
     max_anchor_shift: int,
-) -> tuple[float, int | None, str]:
-    if current.raw_bytes and legacy.raw_bytes:
-        score, shift, compared_bytes, anchor_aware = best_byte_similarity(current, legacy, max_anchor_shift)
-        reason = "anchor-aligned byte overlap" if anchor_aware else "byte-window overlap"
-        return score, shift, f"{reason} ({compared_bytes} byte(s) compared)"
-    if current.disassembly_text and legacy.disassembly_text:
-        return text_similarity(current.disassembly_text, legacy.disassembly_text), None, "disassembly text similarity"
-    return 0.0, None, "missing comparable raw bytes and disassembly"
+) -> tuple[float, int, str]:
+    score, shift, compared_bytes, anchor_aware = best_byte_similarity(current, legacy, max_anchor_shift)
+    reason = "anchor-aligned byte overlap" if anchor_aware else "byte-window overlap"
+    return score, shift, f"{reason} ({compared_bytes} byte(s) compared)"
+
+
+def format_unreadable_reason(current: ComparisonRecord, legacy: ComparisonRecord) -> str:
+    details: list[str] = []
+    current_error = capture_failure_detail(current)
+    legacy_error = capture_failure_detail(legacy)
+    if current_error is not None:
+        details.append(f"current {current_error}")
+    if legacy_error is not None:
+        details.append(f"legacy {legacy_error}")
+    if details:
+        return "; ".join(details)
+    return "missing readable evidence"
+
+
+def capture_failure_detail(record: ComparisonRecord) -> str | None:
+    if not isinstance(record, CaptureFailureRecord):
+        return None
+    return format_diagnostic_detail(
+        record.status,
+        record.error_kind,
+        record.error_message,
+        record.error_code,
+    )
+
+
+def format_diagnostic_detail(
+    status: str,
+    error_kind: str,
+    error_message: str,
+    error_code: str | None,
+) -> str:
+    detail = f"{status} [{error_kind}]: {error_message}"
+    if error_code is not None:
+        detail += f" (code={error_code})"
+    return detail
 
 
 def build_output_payload(
     *,
     inputs: list[Path],
-    all_records: list[EvidenceRecord],
+    all_records: list[ComparisonRecord],
     current_selector: str,
     legacy_selector: str,
     pairings: list[Pairing],
-    unmatched_current: list[EvidenceRecord],
-    unmatched_legacy: list[EvidenceRecord],
+    unmatched_current: list[ComparisonRecord],
+    unmatched_legacy: list[ComparisonRecord],
     skipped_inputs: list[SkippedInput],
     thresholds: dict[str, float | int],
 ) -> dict[str, Any]:
@@ -614,37 +592,87 @@ def build_output_payload(
         "record_count": len(all_records),
         "group_counts": summarize_groups(all_records),
         "summary": summary,
-        "skipped_inputs": [asdict(entry) for entry in skipped_inputs],
-        "unmatched_current": [summarize_record(record) for record in unmatched_current],
-        "unmatched_legacy": [summarize_record(record) for record in unmatched_legacy],
-        "comparisons": [
-            {
-                "relation": pairing.relation,
-                "score": round(pairing.score, 4),
-                "best_shift": pairing.best_shift,
-                "rva_delta": pairing.rva_delta,
-                "reason": pairing.reason,
-                "current": summarize_record(pairing.current),
-                "legacy": summarize_record(pairing.legacy),
-            }
-            for pairing in pairings
-        ],
+        "skipped_inputs": [serialize_skipped_input(entry) for entry in skipped_inputs],
+        "unmatched_current": [serialize_record(record) for record in unmatched_current],
+        "unmatched_legacy": [serialize_record(record) for record in unmatched_legacy],
+        "comparisons": [serialize_pairing(pairing) for pairing in pairings],
     }
 
 
-def summarize_groups(records: Iterable[EvidenceRecord]) -> dict[str, int]:
+def build_no_records_payload(inputs: list[Path], skipped_inputs: list[SkippedInput]) -> dict[str, Any]:
+    return {
+        "inputs": [str(path) for path in inputs],
+        "record_count": 0,
+        "skipped_inputs": [serialize_skipped_input(entry) for entry in skipped_inputs],
+    }
+
+
+def render_no_records_message(skipped_inputs: list[SkippedInput]) -> str:
+    lines = ["No workspace evidence records were found in the provided JSON bundles.", "", "Skipped Inputs"]
+    for entry in skipped_inputs:
+        lines.append(f"- {Path(entry.source_path).name}: {entry.reason}")
+    return "\n".join(lines)
+
+
+def summarize_groups(records: Iterable[ComparisonRecord]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for record in records:
         counts[record.group] = counts.get(record.group, 0) + 1
     return counts
 
 
-def summarize_record(record: EvidenceRecord | None) -> dict[str, Any] | None:
+def serialize_record(record: ComparisonRecord | None) -> dict[str, Any] | None:
     if record is None:
         return None
-    payload = asdict(record)
-    payload.pop("raw_bytes")
+    payload: dict[str, Any] = {
+        "record_kind": "capture_failure" if isinstance(record, CaptureFailureRecord) else "evidence",
+        "source_path": record.source_path,
+        "source_index": record.source_index,
+        "label": record.label,
+        "group": record.group,
+        "notes": record.notes,
+        "capture_timestamp": record.capture_timestamp,
+        "capture_mode": record.capture_mode,
+        "process_state": record.process_state,
+        "process_name": record.process_name,
+        "pid": record.pid,
+        "module_path": record.module_path,
+        "module_base": record.module_base,
+        "target_rva": record.target_rva,
+        "target_va": record.target_va,
+    }
+    if isinstance(record, CaptureFailureRecord):
+        payload["status"] = record.status
+        payload["error_kind"] = record.error_kind
+        payload["error_message"] = record.error_message
+        payload["error_traceback"] = record.error_traceback
+        payload["error_code"] = record.error_code
+        payload["error_payload"] = deserialize_json(record.error_payload_json)
+        payload["failure_detail"] = capture_failure_detail(record)
+    else:
+        payload["before"] = record.before
+        payload["after"] = record.after
+        payload["raw_bytes_hex"] = record.raw_bytes_hex
     return payload
+
+
+def serialize_pairing(pairing: Pairing) -> dict[str, Any]:
+    return {
+        "relation": pairing.relation,
+        "score": round(pairing.score, 4),
+        "best_shift": pairing.best_shift,
+        "rva_delta": pairing.rva_delta,
+        "reason": pairing.reason,
+        "current": serialize_record(pairing.current),
+        "legacy": serialize_record(pairing.legacy),
+    }
+
+
+def serialize_skipped_input(entry: SkippedInput) -> dict[str, Any]:
+    return {
+        "source_path": entry.source_path,
+        "reason": entry.reason,
+    }
 
 
 def render_text_report(payload: dict[str, Any]) -> str:
@@ -660,12 +688,9 @@ def render_text_report(payload: dict[str, Any]) -> str:
     summary = payload["summary"]
     summary_text = ", ".join(f"{key}={summary[key]}" for key in sorted(summary))
     lines.append(f"classifications: {summary_text if summary_text else 'none'}")
-    skipped_inputs = payload["skipped_inputs"]
-    lines.append(f"skipped inputs : {len(skipped_inputs)}")
-    unmatched_current = payload["unmatched_current"]
-    lines.append(f"unmatched current: {len(unmatched_current)}")
-    unmatched_legacy = payload["unmatched_legacy"]
-    lines.append(f"unmatched legacy: {len(unmatched_legacy)}")
+    lines.append(f"skipped inputs : {len(payload['skipped_inputs'])}")
+    lines.append(f"unmatched current: {len(payload['unmatched_current'])}")
+    lines.append(f"unmatched legacy: {len(payload['unmatched_legacy'])}")
     lines.append("")
 
     for index, comparison in enumerate(payload["comparisons"], start=1):
@@ -694,30 +719,24 @@ def render_text_report(payload: dict[str, Any]) -> str:
             "sources        : "
             f"{Path(current['source_path']).name if current else '-'}"
             f"{' | ' + Path(legacy['source_path']).name if legacy else ''}"
-            )
+        )
         lines.append("")
 
-    if unmatched_current:
+    if payload["unmatched_current"]:
         lines.append("Current Records Without A Legacy Pair")
-        for record in unmatched_current:
-            lines.append(
-                f"- {record['label']} rva={format_int(record.get('target_rva'))} "
-                f"group={record['group']} source={Path(record['source_path']).name}"
-            )
+        for record in payload["unmatched_current"]:
+            lines.append(format_unmatched_record(record))
         lines.append("")
 
-    if unmatched_legacy:
+    if payload["unmatched_legacy"]:
         lines.append("Legacy Records Without A Current Pair")
-        for record in unmatched_legacy:
-            lines.append(
-                f"- {record['label']} rva={format_int(record.get('target_rva'))} "
-                f"group={record['group']} source={Path(record['source_path']).name}"
-            )
+        for record in payload["unmatched_legacy"]:
+            lines.append(format_unmatched_record(record))
         lines.append("")
 
-    if skipped_inputs:
+    if payload["skipped_inputs"]:
         lines.append("Skipped Inputs")
-        for entry in skipped_inputs:
+        for entry in payload["skipped_inputs"]:
             lines.append(f"- {Path(entry['source_path']).name}: {entry['reason']}")
 
     return "\n".join(lines).rstrip()
@@ -729,6 +748,16 @@ def record_label_for_text(record: dict[str, Any] | None) -> str:
     return str(record["label"])
 
 
+def format_unmatched_record(record: dict[str, Any]) -> str:
+    line = (
+        f"- {record['label']} rva={format_int(record.get('target_rva'))} "
+        f"group={record['group']} source={Path(record['source_path']).name}"
+    )
+    if record.get("record_kind") == "capture_failure" and record.get("failure_detail"):
+        line += f" error={record['failure_detail']}"
+    return line
+
+
 def best_byte_similarity(
     current: EvidenceRecord,
     legacy: EvidenceRecord,
@@ -736,7 +765,7 @@ def best_byte_similarity(
 ) -> tuple[float, int, int, bool]:
     if can_anchor_align(current) and can_anchor_align(legacy):
         return best_anchor_aligned_overlap(current, legacy, max_anchor_shift)
-    score, shift, compared_bytes = best_linear_overlap(current.raw_bytes or b"", legacy.raw_bytes or b"", max_anchor_shift)
+    score, shift, compared_bytes = best_linear_overlap(current.raw_bytes, legacy.raw_bytes, max_anchor_shift)
     return score, shift, compared_bytes, False
 
 
@@ -745,9 +774,7 @@ def best_anchor_aligned_overlap(
     legacy: EvidenceRecord,
     max_anchor_shift: int,
 ) -> tuple[float, int, int, bool]:
-    expected_shift = None
-    if current.target_rva is not None and legacy.target_rva is not None:
-        expected_shift = current.target_rva - legacy.target_rva
+    expected_shift = current.target_rva - legacy.target_rva
 
     best_score = -1.0
     best_shift = 0
@@ -760,7 +787,6 @@ def best_anchor_aligned_overlap(
             or (
                 math.isclose(score, best_score)
                 and compared_bytes == best_compared_bytes
-                and expected_shift is not None
                 and abs(shift - expected_shift) < abs(best_shift - expected_shift)
             )
         ):
@@ -774,8 +800,6 @@ def best_anchor_aligned_overlap(
 
 
 def anchor_aligned_overlap(current: EvidenceRecord, legacy: EvidenceRecord, shift: int) -> tuple[float, int]:
-    current_bytes = current.raw_bytes or b""
-    legacy_bytes = legacy.raw_bytes or b""
     current_anchor = anchor_index(current)
     legacy_anchor = anchor_index(legacy)
     if current_anchor is None or legacy_anchor is None:
@@ -795,7 +819,7 @@ def anchor_aligned_overlap(current: EvidenceRecord, legacy: EvidenceRecord, shif
         current_index = current_anchor + offset
         legacy_index = legacy_anchor + offset + shift
         compared_bytes += 1
-        if current_bytes[current_index] == legacy_bytes[legacy_index]:
+        if current.raw_bytes[current_index] == legacy.raw_bytes[legacy_index]:
             equal += 1
     return equal / compared_bytes, compared_bytes
 
@@ -824,9 +848,9 @@ def best_linear_overlap(current: bytes, legacy: bytes, max_anchor_shift: int) ->
     return best_score, best_shift, best_compared_bytes
 
 
-def iter_candidate_shifts(expected_shift: int | None, max_anchor_shift: int) -> Iterable[int]:
+def iter_candidate_shifts(expected_shift: int, max_anchor_shift: int) -> Iterable[int]:
     seen: set[int] = set()
-    if expected_shift is not None and abs(expected_shift) <= max_anchor_shift:
+    if abs(expected_shift) <= max_anchor_shift:
         seen.add(expected_shift)
         yield expected_shift
     for shift in range(-max_anchor_shift, max_anchor_shift + 1):
@@ -834,204 +858,44 @@ def iter_candidate_shifts(expected_shift: int | None, max_anchor_shift: int) -> 
             yield shift
 
 
-def text_similarity(left: str, right: str) -> float:
-    left_tokens = left.split()
-    right_tokens = right.split()
-    if not left_tokens or not right_tokens:
-        return 0.0
-    overlap = sum(1 for index, token in enumerate(left_tokens[: len(right_tokens)]) if token == right_tokens[index])
-    return overlap / max(len(left_tokens), len(right_tokens))
-
-
-def is_readable(record: EvidenceRecord) -> bool:
-    return bool(record.raw_bytes or record.disassembly_text)
-
-
-def classify_group(group: str) -> str:
-    token = normalize_token(group)
-    for group_kind, aliases in GROUP_KIND_ALIASES.items():
-        if token in aliases:
-            return group_kind
-    return OTHER_GROUP_KIND
-
-
-def canonical_group_kind(selector: str) -> str:
-    token = normalize_token(selector)
-    for group_kind, aliases in GROUP_KIND_ALIASES.items():
-        if token == group_kind or token in aliases:
-            return group_kind
-    return token
-
-
-def first_value(payload: dict[str, Any], *paths: str, default: Any = None) -> Any:
-    for path in paths:
-        value = get_path(payload, path)
-        if value is not None:
-            return value
-    return default
-
-
-def get_path(payload: dict[str, Any], path: str) -> Any:
-    current: Any = payload
-    for segment in path.split("."):
-        if not isinstance(current, dict) or segment not in current:
-            return None
-        current = current[segment]
-    return current
-
-
-def merge_parent_context(parent: dict[str, Any], child: dict[str, Any]) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for key, value in parent.items():
-        if key in WRAPPER_KEYS:
-            continue
-        merged[key] = value
-    for key, value in child.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = merge_parent_context(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
-def is_probable_evidence_record(payload: dict[str, Any]) -> bool:
-    has_address = any(has_meaningful_value(get_path(payload, path)) for path in RECORD_ADDRESS_PATHS)
-    has_evidence = any(has_meaningful_value(get_path(payload, path)) for path in RECORD_EVIDENCE_PATHS)
-    return has_address and has_evidence
-
-
-def has_meaningful_value(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, (list, tuple, set, dict)):
-        return bool(value)
-    return True
-
-
-def stringify(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value)
-
-
-def optional_string(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def parse_int_value(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        return int(text, 0)
-    return None
-
-
-def parse_int_field(payload: dict[str, Any], field_name: str, *paths: str) -> int | None:
-    value = first_value(payload, *paths)
-    if value is None:
-        return None
-    try:
-        return parse_int_value(value)
-    except ValueError as exc:
-        raise RecordParseError(f"invalid {field_name} value {value!r}") from exc
-
-
-def parse_raw_bytes(value: Any) -> bytes | None:
-    if value is None:
-        return None
-    if isinstance(value, list):
-        try:
-            return bytes(int(item) & 0xFF for item in value)
-        except (TypeError, ValueError):
-            return None
-    if isinstance(value, str):
-        tokens = HEX_TOKEN_RE.findall(value)
-        if not tokens:
-            return None
-        return bytes(int(token, 16) for token in tokens)
-    return None
-
-
-def parse_disassembly_text(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        text = value.strip()
-        return text or None
-    if isinstance(value, list):
-        lines: list[str] = []
-        for item in value:
-            if isinstance(item, str):
-                stripped = item.strip()
-                if stripped:
-                    lines.append(stripped)
-                continue
-            if isinstance(item, dict):
-                mnemonic = optional_string(item.get("mnemonic")) or "?"
-                op_str = optional_string(item.get("op_str")) or ""
-                address = parse_int_value(item.get("address"))
-                prefix = f"{address:016X}: " if address is not None else ""
-                lines.append(f"{prefix}{mnemonic} {op_str}".rstrip())
-        if lines:
-            return "\n".join(lines)
-    return None
-
-
 def normalize_token(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.casefold())
 
 
+def label_address_suffix(label: str) -> str | None:
+    match = re.search(r"([0-9A-Fa-f]{4,})$", label)
+    if match is None:
+        return None
+    return match.group(1).upper()
+
+
 def can_anchor_align(record: EvidenceRecord) -> bool:
-    return record.raw_bytes is not None and anchor_index(record) is not None
+    return anchor_index(record) is not None
 
 
 def anchor_index(record: EvidenceRecord) -> int | None:
-    if record.raw_bytes is None or record.before is None:
-        return None
     if 0 <= record.before < len(record.raw_bytes):
         return record.before
     return None
 
 
 def relative_bounds(record: EvidenceRecord) -> tuple[int, int]:
-    raw_bytes = record.raw_bytes or b""
     anchor = anchor_index(record)
     if anchor is None:
         return (0, -1)
-    left_extent = anchor
-    right_extent = len(raw_bytes) - anchor - 1
-    if record.before is not None:
-        left_extent = min(left_extent, record.before)
-    if record.after is not None:
-        right_extent = min(right_extent, record.after)
+    left_extent = min(anchor, record.before)
+    right_extent = min(len(record.raw_bytes) - anchor - 1, record.after)
     return (-left_extent, right_extent)
 
 
 def shift_matches_delta(best_shift: int | None, rva_delta: int | None) -> bool:
-    if best_shift is None:
+    if best_shift is None or rva_delta is None:
         return False
-    if rva_delta is None:
-        return True
     return best_shift == rva_delta
 
 
-def sort_key(record: EvidenceRecord) -> tuple[int, str, str]:
-    rva = record.target_rva if record.target_rva is not None else sys.maxsize
-    return (rva, record.label_key, record.source_path)
+def sort_key(record: ComparisonRecord) -> tuple[int, str, str]:
+    return (record.target_rva, record.label_key, record.source_path)
 
 
 def format_int(value: int | None) -> str:
@@ -1039,6 +903,155 @@ def format_int(value: int | None) -> str:
         return "-"
     sign = "-" if value < 0 else ""
     return f"{sign}0x{abs(value):X}"
+
+
+def require_mapping(value: Any, field_name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise BundleParseError(f"{field_name} must be an object")
+    return value
+
+
+def require_mapping_field(payload: dict[str, Any], field_name: str) -> dict[str, Any]:
+    if field_name not in payload:
+        raise BundleParseError(f"missing required top-level field '{field_name}'")
+    value = payload[field_name]
+    if not isinstance(value, dict):
+        raise BundleParseError(f"field '{field_name}' must be an object")
+    return value
+
+
+def require_list(payload: dict[str, Any], field_name: str) -> list[Any]:
+    if field_name not in payload:
+        raise BundleParseError(f"missing required top-level field '{field_name}'")
+    value = payload[field_name]
+    if not isinstance(value, list):
+        raise BundleParseError(f"field '{field_name}' must be a list")
+    return value
+
+
+def require_bundle_string(payload: dict[str, Any], key: str, field_name: str | None = None) -> str:
+    field = field_name or key
+    if key not in payload:
+        raise BundleParseError(f"missing required top-level field '{field}'")
+    value = payload[key]
+    if not isinstance(value, str) or not value.strip():
+        raise BundleParseError(f"field '{field}' must be a non-empty string")
+    return value.strip()
+
+
+def require_record_string(payload: dict[str, Any], key: str, field_name: str | None = None) -> str:
+    field = field_name or key
+    if key not in payload:
+        raise RecordParseError(f"missing required field '{field}'")
+    value = payload[key]
+    if not isinstance(value, str) or not value.strip():
+        raise RecordParseError(f"field '{field}' must be a non-empty string")
+    return value.strip()
+
+
+def require_bundle_int(payload: dict[str, Any], key: str, field_name: str | None = None) -> int:
+    field = field_name or key
+    if key not in payload:
+        raise BundleParseError(f"missing required top-level field '{field}'")
+    try:
+        return parse_int_value(payload[key], field)
+    except ValueError as exc:
+        raise BundleParseError(str(exc)) from exc
+
+
+def require_record_int(payload: dict[str, Any], key: str, field_name: str | None = None) -> int:
+    field = field_name or key
+    if key not in payload:
+        raise RecordParseError(f"missing required field '{field}'")
+    try:
+        return parse_int_value(payload[key], field)
+    except ValueError as exc:
+        raise RecordParseError(str(exc)) from exc
+
+
+def require_record_mapping_field(payload: dict[str, Any], key: str, field_name: str | None = None) -> dict[str, Any]:
+    field = field_name or key
+    if key not in payload:
+        raise RecordParseError(f"missing required field '{field}'")
+    value = payload[key]
+    if not isinstance(value, dict):
+        raise RecordParseError(f"field '{field}' must be an object")
+    return value
+
+
+def optional_int(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    try:
+        return parse_int_value(value, field_name)
+    except ValueError as exc:
+        raise RecordParseError(str(exc)) from exc
+
+
+def optional_string(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RecordParseError(f"field '{field_name}' must be a string when present")
+    text = value.strip()
+    return text or None
+
+
+def optional_error_code(error_payload: dict[str, Any]) -> str | None:
+    for key in ("code", "winerror", "errno"):
+        if key not in error_payload:
+            continue
+        value = error_payload[key]
+        if isinstance(value, bool):
+            raise RecordParseError(f"field 'error.{key}' must not be boolean")
+        if isinstance(value, (int, str)):
+            text = str(value).strip()
+            return text or None
+        raise RecordParseError(f"field 'error.{key}' must be an int or string when present")
+    return None
+
+
+def parse_int_value(value: Any, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"field '{field_name}' must not be boolean")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError(f"field '{field_name}' must not be empty")
+        try:
+            return int(text, 0)
+        except ValueError as exc:
+            raise ValueError(f"field '{field_name}' has invalid integer value {value!r}") from exc
+    raise ValueError(f"field '{field_name}' must be an int or string")
+
+
+def parse_raw_bytes_hex(value: str) -> bytes:
+    compact = "".join(value.split())
+    if not compact:
+        raise RecordParseError("field 'raw_bytes_hex' must not be empty")
+    if not re.fullmatch(r"[0-9A-Fa-f]+", compact):
+        raise RecordParseError("field 'raw_bytes_hex' must contain only hexadecimal digits")
+    if len(compact) % 2 != 0:
+        raise RecordParseError("field 'raw_bytes_hex' must contain an even number of hexadecimal digits")
+    return bytes.fromhex(compact)
+
+
+def result_label_hint(payload: Any, source_index: int) -> str:
+    if isinstance(payload, dict):
+        label = payload.get("label")
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+    return f"result#{source_index}"
+
+
+def serialize_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True)
+
+
+def deserialize_json(value: str) -> Any:
+    return json.loads(value)
 
 
 if __name__ == "__main__":

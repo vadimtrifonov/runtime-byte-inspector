@@ -5,20 +5,24 @@ import unittest
 from datetime import datetime
 from importlib.metadata import version
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from support import BASE, write_pe
 
-from scripts.capture import (
-    Target,
-    capture_target,
-    capture_targets,
-    load_target_list,
-    validate_window,
-    window_bounds,
-    write_capture,
-)
+from scripts.capture import capture_target, capture_targets, write_capture
 from scripts.pe import Module, PeImage
+from scripts.targets import Target, load_target_list, validate_window, window_bounds
+
+
+def capture_bytes(target, module, read, before, after):
+    source = SimpleNamespace(
+        module=module,
+        kind="pe_file",
+        read_va=lambda va, size: read(va - module.base, size),
+        describe=lambda va: {"va": hex(va), "rva": hex(va - module.base), "module": module.metadata()},
+    )
+    return capture_target(target, source, before, after)
 
 
 class CaptureTests(unittest.TestCase):
@@ -84,6 +88,32 @@ class CaptureTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load_target_list(path)
 
+    def test_runtime_target_list_accepts_explicit_va_pointer_and_span_requests(self):
+        path = self.root / "targets.json"
+        entries = [
+            {"label": "code", "va": "0x123000", "decode_va": "0x122ffe", "span": "0x10"},
+            {"label": "slot", "va": 0x123100, "kind": "pointer"},
+            {"label": "module", "rva": 0, "decode_rva": None},
+        ]
+        path.write_text(json.dumps({"targets": entries}))
+        _, targets = load_target_list(path)
+        self.assertEqual(targets[0].span, 16)
+        self.assertEqual(targets[0].decode_va, 0x122FFE)
+        self.assertEqual(targets[1].kind, "pointer")
+        self.assertEqual(targets[2].rva, 0)
+        for entry in (
+            {"label": "both", "va": 1, "rva": 1},
+            {"label": "overflow", "va": 1 << 64},
+            {"label": "origin", "va": 1, "decode_rva": 1},
+            {"label": "pointer", "va": 1, "kind": "pointer", "span": 8},
+            {"label": "pointer", "va": 1, "kind": "pointer", "decode_va": 0},
+            {"label": "span", "rva": 0, "span": 0},
+        ):
+            with self.subTest(entry=entry):
+                path.write_text(json.dumps({"targets": [entry]}))
+                with self.assertRaises(ValueError):
+                    load_target_list(path)
+
     def test_example_target_list_can_be_captured(self):
         metadata, targets = load_target_list(
             Path(__file__).resolve().parents[1] / "examples" / "targets.json"
@@ -97,18 +127,18 @@ class CaptureTests(unittest.TestCase):
         # A prefix byte consumed the FF opcode in a historical formatting capture.
         blob = bytes.fromhex("01 FF 15 E0 67 ED FF 45 33 C0")
         module = Module("fixture", "fixture", BASE, len(blob), 1)
-        result = capture_target(
+        result = capture_bytes(
             Target("call", 1), module, lambda start, size: blob[start : start + size], 1, 8
         )
-        self.assertEqual(
-            result["read"], {"status": "ok", "start_rva": "0x0", "bytes_hex": blob.hex().upper()}
-        )
+        self.assertEqual(result["read"]["status"], "ok")
+        self.assertEqual(result["read"]["start_rva"], "0x0")
+        self.assertEqual(result["read"]["bytes_hex"], blob.hex().upper())
         instruction = result["decode"]["instructions"][0]
         self.assertEqual((instruction["mnemonic"], instruction["rva"]), ("call", "0x1"))
         self.assertEqual(instruction["bytes_hex"], "FF15E067EDFF")
         self.assertIn("operands", instruction)
         self.assertEqual(result["decode"]["start_rva"], "0x1")
-        explicit = capture_target(
+        explicit = capture_bytes(
             Target("call", 1, decode_rva=0), module, lambda start, size: blob[start : start + size], 1, 8
         )
         self.assertEqual(explicit["decode"]["instructions"][0]["bytes_hex"], "01FF")
@@ -118,7 +148,7 @@ class CaptureTests(unittest.TestCase):
     def test_decoder_failure_preserves_successful_bytes(self):
         module = Module("fixture", "fixture", BASE, 3, 1)
         with mock.patch("scripts.capture.decode", side_effect=RuntimeError("decoder failed")):
-            result = capture_target(Target("site", 0), module, lambda *_: b"\x90\x90\xc3", 0, 2)
+            result = capture_bytes(Target("site", 0), module, lambda *_: b"\x90\x90\xc3", 0, 2)
         self.assertEqual(result["read"]["status"], "ok")
         self.assertEqual(result["read"]["bytes_hex"], "9090C3")
         self.assertEqual(result["decode"]["status"], "error")
@@ -127,13 +157,13 @@ class CaptureTests(unittest.TestCase):
     def test_failed_reads_and_decoding_preserve_target_definitions(self):
         module = Module("fixture", "fixture", BASE, 100, 1)
         target = Target("site", 10, "code", "assumed boundary", decode_rva=0)
-        result = capture_target(target, module, lambda *_: b"\x90", 1, 2)
+        result = capture_bytes(target, module, lambda *_: b"\x90", 1, 2)
         self.assertEqual(result["target"], target.to_dict())
         self.assertEqual(result["read"]["status"], "error")
         self.assertIn("Short read", result["read"]["error"]["message"])
         self.assertNotIn("bytes_hex", result["read"])
         self.assertNotIn("decode", result)
-        result = capture_target(target, module, lambda *_: b"\x90" * 4, 1, 2)
+        result = capture_bytes(target, module, lambda *_: b"\x90" * 4, 1, 2)
         self.assertEqual(result["target"], target.to_dict())
         self.assertEqual(result["read"]["status"], "ok")
         self.assertEqual(result["decode"]["status"], "error")
@@ -147,15 +177,17 @@ class CaptureTests(unittest.TestCase):
             )
         self.assertEqual(
             capture["summary"],
-            {"target_count": 2, "captured_ok": 1, "captured_error": 1, "decode_error": 0},
+            {"target_count": 2, "captured_ok": 1, "captured_error": 1, "decode_error": 0, "error_count": 1},
         )
         self.assertLessEqual(
             datetime.fromisoformat(capture["started_at"]), datetime.fromisoformat(capture["finished_at"])
         )
-        self.assertEqual(capture["request"], {"window": {"before": 0, "after": 1}})
+        self.assertNotIn("format_version", capture)
+        self.assertEqual(capture["request"], {"window": {"before": 0, "after": 1}, "follow": 0})
         self.assertEqual(capture["annotations"], {"runtime": "fixture build"})
         self.assertEqual(capture["results"][0]["read"]["bytes_hex"], "C30F")
-        self.assertEqual(capture["results"][0]["decode"]["status"], "incomplete")
+        self.assertEqual(capture["results"][0]["decode"]["status"], "stopped")
+        self.assertEqual(capture["results"][0]["decode"]["stop_reason"], "return")
         self.assertEqual(capture["results"][0]["decode"]["instructions"][0]["bytes_hex"], "C3")
         self.assertEqual(capture["source"]["module"]["pe_timestamp"], "0x65a00001")
         self.assertEqual(capture["source"]["module"]["image_size"], 0x2000)

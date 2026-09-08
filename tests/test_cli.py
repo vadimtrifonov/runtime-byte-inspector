@@ -134,13 +134,49 @@ class CliTests(unittest.TestCase):
             "inspect", "--file", self.image, "--rva", "0x1000", "--before", 0, "--after", 1
         )
         self.assertEqual((status, errors), (0, ""))
-        self.assertIn("undecoded from 0x1001: 0F", output)
+        self.assertIn("raw context after block from 0x140001001: 0F", output)
+        write_pe(self.image, b"\x90\x0f")
+        status, output, errors = self.run_cli(
+            "inspect", "--file", self.image, "--rva", "0x1000", "--before", 0, "--after", 1
+        )
+        self.assertEqual((status, errors), (0, ""))
+        self.assertIn("undecoded from 0x140001001: 0F", output)
+
+    def test_file_va_and_decoding_origin_remain_preferred_image_relative(self):
+        write_pe(self.image, bytes.fromhex("488BC45741544155415641574883EC40C3"))
+        status, output, errors = self.run_cli(
+            "inspect",
+            "--file",
+            self.image,
+            "--va",
+            "0x140001000",
+            "--decode-va",
+            "0x140001000",
+            "--before",
+            0,
+            "--after",
+            16,
+            "--span",
+            16,
+            "--format",
+            "json",
+        )
+        self.assertEqual((status, errors), (0, ""))
+        result = json.loads(output)["results"][0]
+        self.assertEqual(result["target"]["rva"], "0x1000")
+        self.assertEqual(result["span"]["end_status"], "boundary")
+        self.assertEqual(result["span"]["relative_instructions"], [])
 
     def test_invalid_source_options_and_invalid_captures_have_no_stdout(self):
         for args in (
             ("inspect", "--file", self.image, "--module", "other.dll", "--rva", 0),
             ("inspect", "--file", self.image, "--patch-state", "unpatched", "--rva", 0),
             ("inspect", "--file", self.image, "--va", 1),
+            ("inspect", "--file", self.image, "--rva", "0x1000", "--pointer"),
+            ("inspect", "--file", self.image, "--rva", "0x1000", "--follow", 1),
+            ("inspect", "--file", self.image, "--rva", "0x1000", "--span", 0),
+            ("inspect", "--file", self.image, "--rva", "0x1000", "--span", 66),
+            ("inspect", "--file", self.image, "--rva", "0x1000", "--decode-va", "0x140001000"),
             ("compare", self.image, self.image),
             ("compare", self.root, self.root),
         ):

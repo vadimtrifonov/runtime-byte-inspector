@@ -56,6 +56,44 @@ class ComparisonTests(unittest.TestCase):
         self.assertTrue(relative["windows_equal"])
         self.assertEqual(relative["overlap"], {"start": -1, "end_exclusive": 2})
 
+    def test_va_captures_compare_only_with_explicit_target_alignment(self):
+        def capture(va):
+            result = {
+                "target": {"label": "private", "va": hex(va)},
+                "read": {"status": "ok", "start_va": hex(va), "requested_bytes": 2, "bytes_hex": "90C3"},
+            }
+            return saved_capture([result])
+
+        left = self.save("private-before.json", capture(0x123000))
+        right = self.save("private-after.json", capture(0x456000))
+        with self.assertRaisesRegex(ValueError, "alignment target"):
+            compare_captures(left, right)
+        report = compare_captures(left, right, alignment="target")
+        self.assertTrue(report["comparisons"][0]["windows_equal"])
+        self.assertEqual(report["comparisons"][0]["left"]["target_va"], "0x123000")
+        invalid = capture(0x123000)
+        invalid["results"][0]["read"]["start_rva"] = "0x0"
+        with self.assertRaisesRegex(ValueError, "must not claim"):
+            load_capture(self.save("invalid.json", invalid))
+        invalid = capture(0x123000)
+        invalid["results"][0]["read"]["requested_bytes"] = 3
+        with self.assertRaisesRegex(ValueError, "byte count"):
+            load_capture(self.save("invalid.json", invalid))
+
+    def test_pointer_cells_compare_exactly_eight_bytes_not_the_code_window(self):
+        result = {
+            "target": {"label": "slot", "rva": "0x1000", "kind": "pointer"},
+            "read": {"status": "ok", "start_rva": "0x1000", "bytes_hex": "00" * 8},
+        }
+        payload = saved_capture([result], before=32, after=64)
+        path = self.save("pointer.json", payload)
+        pair = compare_captures(path, path)["comparisons"][0]
+        self.assertEqual(pair["compared_bytes"], 8)
+        self.assertTrue(pair["windows_equal"])
+        payload["results"][0]["read"]["bytes_hex"] = "00" * 7
+        with self.assertRaisesRegex(ValueError, "byte range"):
+            load_capture(self.save("short.json", payload))
+
     def test_captures_pair_only_equal_labels_and_allow_explicit_pair_selection(self):
         left_path = self.save(
             "left.json",

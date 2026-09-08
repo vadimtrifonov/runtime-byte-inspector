@@ -1,0 +1,7 @@
+{
+  "description": "Example targets; replace these RVAs with locations in the module being inspected.",
+  "targets": [
+    {"label": "function-entry", "rva": "0x1000", "group": "code"},
+    {"label": "call-site", "rva": "0x1020", "group": "code"}
+  ]
+}

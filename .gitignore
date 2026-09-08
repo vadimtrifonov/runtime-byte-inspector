@@ -5,4 +5,4 @@ __pycache__/
 *.pyd
 .worktrees/
 .tmp/
-evidence/
+/captures/

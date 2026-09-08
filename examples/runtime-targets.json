@@ -1,0 +1,8 @@
+{
+  "description": "Runtime examples only: replace the RVA and process-specific VAs with addresses from the selected process.",
+  "targets": [
+    {"label": "function-entry", "rva": "0x1000", "span": 16, "group": "code"},
+    {"label": "allocated-code", "va": "0x1C000002000", "group": "code"},
+    {"label": "pointer-cell", "va": "0x1C000003000", "kind": "pointer", "group": "data"}
+  ]
+}

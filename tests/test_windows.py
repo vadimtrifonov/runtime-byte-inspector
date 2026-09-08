@@ -6,8 +6,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.capture import Target, capture_targets, write_capture
+from scripts.capture import capture_targets, write_capture
 from scripts.compare import load_capture
+from scripts.targets import Target
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows process access")

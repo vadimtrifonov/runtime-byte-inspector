@@ -48,6 +48,8 @@ def parse_nt_headers(data: bytes) -> tuple[int, int, int]:
 class PeImage:
     """Read file-backed RVA windows without constructing a runtime image."""
 
+    kind = "pe_file"
+
     def __init__(self, path: Path):
         self.path = path.resolve()
         self.data = self.path.read_bytes()
@@ -71,10 +73,18 @@ class PeImage:
 
     def metadata(self) -> dict:
         return {
-            "kind": "pe_file",
+            "kind": self.kind,
             "module": self.module.metadata(),
             "file_sha256": hashlib.sha256(self.data).hexdigest(),
         }
+
+    def describe(self, va: int) -> dict:
+        if not self.module.base <= va < self.module.base + self.module.size:
+            raise ValueError("Address is outside the selected PE image")
+        return {"va": hex(va), "rva": hex(va - self.module.base), "module": self.module.metadata()}
+
+    def read_va(self, va: int, size: int) -> bytes:
+        return self.read(va - self.module.base, size)
 
     def read(self, rva: int, size: int) -> bytes:
         if rva < 0 or size <= 0 or rva + size > self.module.size:

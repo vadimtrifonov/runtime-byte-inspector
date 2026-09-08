@@ -4,27 +4,31 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .capture import PATCH_STATES, integer, text, validate_window, window_bounds
+from .targets import PATCH_STATES, Target, absolute_window, integer, text, validate_window, window_bounds
 
 
 @dataclass(frozen=True)
 class Record:
     label: str
-    rva: int
+    rva: int | None
     before: int
     raw: bytes | None
     error: dict | None
     group: str | None = None
+    va: int | None = None
 
     def start(self, alignment: str) -> int:
+        if alignment == "rva" and self.rva is None:
+            raise ValueError("VA targets require --alignment target; absolute addresses are process-specific")
         return (self.rva if alignment == "rva" else 0) - self.before
 
     def metadata(self) -> dict:
-        result = {"label": self.label, "group": self.group, "target_rva": hex(self.rva)}
+        coordinate, address = ("rva", self.rva) if self.rva is not None else ("va", self.va)
+        result = {"label": self.label, "group": self.group, f"target_{coordinate}": hex(address)}
         if self.raw is None:
             result["error"] = self.error
         else:
-            result.update(start_rva=hex(self.rva - self.before), byte_count=len(self.raw))
+            result.update({f"start_{coordinate}": hex(address - self.before), "byte_count": len(self.raw)})
         return result
 
 
@@ -54,7 +58,7 @@ def load_capture(path: Path) -> tuple[dict, list[Record]]:
         if not isinstance(module, dict):
             raise ValueError("source.module must be an object")
         text(module.get("path"), "source.module.path")
-        integer(module.get("base_address"), "source.module.base_address")
+        base = integer(module.get("base_address"), "source.module.base_address")
         size = integer(module.get("image_size"), "source.module.image_size")
         if size == 0:
             raise ValueError("source.module.image_size must be positive")
@@ -73,7 +77,7 @@ def load_capture(path: Path) -> tuple[dict, list[Record]]:
         records = []
         labels = set()
         for result in results:
-            record = parse_record(result, size, before, after)
+            record = parse_record(result, size, before, after, module_base=base, kind=kind)
             if record.label in labels:
                 raise ValueError(f"Duplicate result label: {record.label!r}")
             labels.add(record.label)
@@ -92,12 +96,26 @@ def load_capture(path: Path) -> tuple[dict, list[Record]]:
     return metadata, records
 
 
-def parse_record(result: object, module_size: int, before: int, after: int) -> Record:
+def parse_record(
+    result: object,
+    module_size: int,
+    before: int,
+    after: int,
+    *,
+    module_base: int,
+    kind: str,
+) -> Record:
     if not isinstance(result, dict) or not isinstance(result.get("target"), dict):
         raise ValueError("Each result must contain a target object")
     target = result["target"]
     label = text(target.get("label"), "target.label")
-    rva = integer(target.get("rva"), f"{label} target.rva")
+    address_fields = {
+        key: integer(target[key], f"{label} target.{key}") for key in ("rva", "va") if key in target
+    }
+    selected = Target(label, kind=target.get("kind", "code"), **address_fields)
+    rva, va = selected.rva, selected.va
+    if kind != "live_process" and (va is not None or selected.kind == "pointer"):
+        raise ValueError("VA targets and pointer cells require a live-process capture")
     group = target.get("group")
     if group is not None:
         text(group, f"{label} target.group")
@@ -111,22 +129,41 @@ def parse_record(result: object, module_size: int, before: int, after: int) -> R
         text(error.get("message"), f"{label} read.error.message")
         if "bytes_hex" in read:
             raise ValueError(f"{label} read failure must not contain captured bytes")
-        return Record(label, rva, 0, None, error, group)
+        return Record(label, rva, 0, None, error, group, va)
     if read.get("status") != "ok" or "error" in read:
         raise ValueError(f"{label} has an invalid read status")
-    start = integer(read.get("start_rva"), f"{label} read.start_rva")
+    coordinate, address = ("rva", rva) if rva is not None else ("va", va)
+    start = integer(read.get(f"start_{coordinate}"), f"{label} read.start_{coordinate}")
     raw = bytes.fromhex(text(read.get("bytes_hex"), f"{label} read.bytes_hex"))
-    expected_start, expected_end = window_bounds(module_size, rva, before, after)
+    if selected.kind == "pointer":
+        expected_start, expected_end = absolute_window(address, 0, 7)
+        if rva is not None and expected_end > module_size:
+            raise ValueError(f"{label} pointer cell exceeds the selected module")
+    elif rva is not None:
+        expected_start, expected_end = window_bounds(module_size, rva, before, after)
+    else:
+        expected_start, expected_end = absolute_window(va, before, after)
     if start != expected_start or len(raw) != expected_end - expected_start:
         raise ValueError(f"{label} captured byte range disagrees with its requested window")
-    return Record(label, rva, rva - start, raw, None, group)
+    if (
+        rva is not None
+        and "start_va" in read
+        and integer(read["start_va"], "read.start_va") != module_base + start
+    ):
+        raise ValueError(f"{label} read VA disagrees with its RVA and module base")
+    if va is not None and "start_rva" in read:
+        raise ValueError(f"{label} VA read must not claim a selected-module RVA")
+    if "requested_bytes" in read and integer(read["requested_bytes"], "read.requested_bytes") != len(raw):
+        raise ValueError(f"{label} requested byte count disagrees with captured bytes")
+    return Record(label, rva, address - start, raw, None, group, va)
 
 
 def compare_records(left: Record, right: Record, alignment: str) -> dict:
+    # Require explicit target alignment even when a VA target's read failed.
+    left_start, right_start = left.start(alignment), right.start(alignment)
     result = {"left": left.metadata(), "right": right.metadata()}
     if left.raw is None or right.raw is None:
         return {**result, "status": "unreadable"}
-    left_start, right_start = left.start(alignment), right.start(alignment)
     start = max(left_start, right_start)
     end = min(left_start + len(left.raw), right_start + len(right.raw))
     count = max(0, end - start)

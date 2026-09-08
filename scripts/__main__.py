@@ -5,17 +5,11 @@ import json
 import sys
 from pathlib import Path
 
-from .capture import (
-    PATCH_STATES,
-    Target,
-    capture_targets,
-    integer,
-    load_target_list,
-    validate_window,
-    write_capture,
-)
+from .capture import capture_targets, iter_errors, write_capture
 from .compare import compare_captures, render_report
 from .pe import PeImage
+from .render import render_inspection
+from .targets import MAX_FOLLOW_HOPS, PATCH_STATES, Target, integer, load_target_list, validate_window
 
 
 def address(value: str) -> int:
@@ -34,18 +28,43 @@ def build_parser() -> argparse.ArgumentParser:
         source.add_argument("--file", type=Path, help="PE file (disk bytes, not a live image)")
         source.add_argument("--pid", type=int, help="PID to read; no process-name default")
         source.add_argument("--process", help="Exact executable name; must match one running process")
-        command.add_argument("--module", help="Loaded module name (default: the process executable)")
-        command.add_argument("--before", type=address, default=32, help="Bytes before target (default: 32)")
-        command.add_argument("--after", type=address, default=64, help="Bytes after target (default: 64)")
+        command.add_argument(
+            "--module", help="Loaded module for RVA targets (default: the process executable)"
+        )
+        command.add_argument(
+            "--before", type=address, default=32, help="Code bytes before target (default: 32)"
+        )
+        command.add_argument(
+            "--after",
+            type=address,
+            default=64,
+            help="Code bytes after target, including followed windows (default: 64)",
+        )
+        command.add_argument(
+            "--follow",
+            type=address,
+            default=0,
+            help=f"Follow up to N live jump/pointer hops (0..{MAX_FOLLOW_HOPS}, default: 0)",
+        )
         command.add_argument(
             "--patch-state", choices=PATCH_STATES, help="Live-target annotation (default: unknown)"
         )
         command.add_argument("--runtime", help="Optional operator-supplied runtime/build description")
     target = inspect.add_mutually_exclusive_group(required=True)
-    target.add_argument("--rva", type=address, help="Target module-relative address")
-    target.add_argument("--va", type=address, help="Live VA, or preferred-image VA for a file")
+    target.add_argument("--rva", type=address, help="Target address relative to the selected module")
+    target.add_argument(
+        "--va", type=address, help="Absolute live-process address, or preferred-image VA for a file"
+    )
+    origin = inspect.add_mutually_exclusive_group()
+    origin.add_argument("--decode-rva", type=address, help="Assumed decoding start for an RVA target")
+    origin.add_argument("--decode-va", type=address, help="Assumed decoding start for a VA target")
     inspect.add_argument(
-        "--decode-rva", type=address, help="Assumed instruction start within the window (default: target)"
+        "--pointer",
+        action="store_true",
+        help="Read exactly one 8-byte live pointer cell instead of decoding code",
+    )
+    inspect.add_argument(
+        "--span", type=address, help="Summarize the first N target bytes using the captured decoding"
     )
     inspect.add_argument("--format", choices=("text", "json"), default="text")
     capture.add_argument("--targets", type=Path, required=True, help="Target-list JSON file")
@@ -54,8 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     capture.add_argument("--output", type=Path, required=True, help="Destination JSON capture")
     capture.add_argument("--overwrite", action="store_true", help="Replace an existing destination")
-
-    compare = commands.add_parser("compare", help="Compare two saved captures")
+    compare = commands.add_parser("compare", help="Compare primary target windows in two saved captures")
     compare.add_argument("left", type=Path)
     compare.add_argument("right", type=Path)
     compare.add_argument("--left-label", help="Select one left result instead of pairing equal labels")
@@ -64,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--alignment",
         choices=("rva", "target"),
         default="rva",
-        help="Align module RVAs or offsets from each target (default: rva)",
+        help="Align module RVAs or offsets from targets; VA targets require target alignment",
     )
     compare.add_argument("--format", choices=("text", "json"), default="json")
     return parser
@@ -78,47 +96,12 @@ def open_source(args):
     return LiveProcess(pid=args.pid, name=args.process, module_name=args.module)
 
 
-def render_inspection(capture: dict) -> str:
-    source = capture["source"]
-    module = source["module"]
-    base = int(module["base_address"], 0)
-    lines = [f"source: {source['kind']} {module['path']}", f"base: {module['base_address']}"]
-    if "process" in source:
-        lines.append(f"pid: {source['process']['pid']}")
-        lines.append(f"patch state (annotation): {capture['annotations']['patch_state']}")
-    result = capture["results"][0]
-    target_rva = int(result["target"]["rva"], 0)
-    lines.append(f"target RVA: {target_rva:#x} VA: {base + target_rva:#x}")
-    if result["read"]["status"] == "error":
-        return "\n".join(lines)
-    blob = bytes.fromhex(result["read"]["bytes_hex"])
-    start = int(result["read"]["start_rva"], 0)
-    lines.append("\nCaptured bytes (RVA):")
-    for offset in range(0, len(blob), 16):
-        lines.append(f"  {start + offset:08X}  {blob[offset : offset + 16].hex(' ').upper()}")
-    decoded = result["decode"]
-    lines.append(f"\nDecode from assumed instruction start {decoded['start_rva']}: {decoded['status']}")
-    end = int(decoded["start_rva"], 0)
-    for instruction in decoded.get("instructions", []):
-        rva = int(instruction["rva"], 0)
-        end = rva + len(bytes.fromhex(instruction["bytes_hex"]))
-        marker = ">>" if rva == target_rva else ("*>" if rva < target_rva < end else "  ")
-        lines.append(
-            f"{marker} {base + rva:016X}  "
-            f"{instruction['bytes_hex']:<30} {instruction['mnemonic']} {instruction['operands']}".rstrip()
-        )
-    if decoded["status"] == "incomplete":
-        lines.append(f"undecoded from {end:#x}: {blob[end - start :].hex().upper()}")
-    return "\n".join(lines)
-
-
 def report_capture_errors(capture: dict) -> bool:
     failed = False
     for result in capture["results"]:
-        error = result["read"].get("error") or result.get("decode", {}).get("error")
-        if error is not None:
+        for path, error in iter_errors(result):
             failed = True
-            print(f"error [{result['target']['label']}]: {error['message']}", file=sys.stderr)
+            print(f"error [{result['target']['label']} {path}]: {error['message']}", file=sys.stderr)
     return failed
 
 
@@ -135,10 +118,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps(report, indent=2) if args.format == "json" else render_report(report))
             return 0
-
         validate_window(args.before, args.after)
-        if args.file is not None and (args.module is not None or args.patch_state is not None):
-            raise ValueError("--module and --patch-state apply only to live processes")
+        if not 0 <= args.follow <= MAX_FOLLOW_HOPS:
+            raise ValueError(f"--follow must be 0..{MAX_FOLLOW_HOPS}")
+        if args.file is not None and (
+            args.module is not None
+            or args.patch_state is not None
+            or args.follow
+            or getattr(args, "pointer", False)
+        ):
+            raise ValueError("--module, --patch-state, --follow, and --pointer apply only to live processes")
         if args.runtime is not None and not args.runtime.strip():
             raise ValueError("--runtime must not be empty")
         target_list, targets = (
@@ -146,10 +135,25 @@ def main(argv: list[str] | None = None) -> int:
         )
         with open_source(args) as source:
             if args.command == "inspect":
-                rva = args.rva if args.rva is not None else args.va - source.module.base
-                if rva < 0:
-                    raise ValueError("Target VA is below the selected image base")
-                targets = [Target("site", rva, decode_rva=args.decode_rva)]
+                rva, va = args.rva, args.va
+                decode_rva, decode_va = args.decode_rva, args.decode_va
+                if args.file is not None and va is not None:
+                    rva, va = va - source.module.base, None
+                    if rva < 0:
+                        raise ValueError("Target VA is below the selected image base")
+                    if decode_va is not None:
+                        decode_rva, decode_va = decode_va - source.module.base, None
+                targets = [
+                    Target(
+                        "site",
+                        rva,
+                        va=va,
+                        decode_rva=decode_rva,
+                        decode_va=decode_va,
+                        kind="pointer" if args.pointer else "code",
+                        span=args.span,
+                    )
+                ]
             capture = capture_targets(
                 source,
                 targets,
@@ -159,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
                 groups=args.group if args.command == "capture" else None,
                 patch_state=args.patch_state or "unknown",
                 runtime=args.runtime,
+                follow=args.follow,
             )
         if args.command == "capture":
             write_capture(args.output, capture, args.overwrite)

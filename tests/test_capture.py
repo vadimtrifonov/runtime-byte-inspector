@@ -61,7 +61,7 @@ class CaptureTests(unittest.TestCase):
                     ],
                 }
             ),
-            encoding="utf-8",
+            encoding="utf-16",
         )
         metadata, targets = load_target_list(path)
         self.assertEqual([target.label for target in targets], ["one", "two"])
@@ -238,12 +238,16 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text()), {"capture": 2})
         self.assertEqual(list(self.root.iterdir()), [path])
 
-    def test_write_failure_cleans_temporary_file_and_cleanup_failure_is_reported(self):
+    def test_failed_serialization_or_publication_leaves_no_destination(self):
         path = self.root / "capture.json"
         with self.assertRaises(TypeError):
             write_capture(path, {"not_json": object()})
         self.assertEqual(list(self.root.iterdir()), [])
-        with mock.patch.object(Path, "unlink", side_effect=PermissionError("cleanup denied")):
-            with self.assertRaisesRegex(OSError, "also failed to remove temporary file"):
-                write_capture(path, {"not_json": object()})
+        with mock.patch.object(Path, "rename", side_effect=PermissionError("publication denied")):
+            with self.assertRaisesRegex(OSError, "publication denied"):
+                write_capture(path, {"capture": 1})
+            self.assertEqual(list(self.root.iterdir()), [])
+            with mock.patch.object(Path, "unlink", side_effect=PermissionError("cleanup denied")):
+                with self.assertRaisesRegex(OSError, "also failed to remove temporary file"):
+                    write_capture(path, {"capture": 1})
         self.assertFalse(path.exists())

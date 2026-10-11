@@ -6,11 +6,11 @@ import os
 import platform
 import tempfile
 from datetime import datetime, timezone
-from importlib.metadata import version
 from pathlib import Path
+lazy from importlib.metadata import version
 
-from .instructions import decode, span_facts
 from .targets import MAX_FOLLOW_HOPS, PATCH_STATES, Target, absolute_window, validate_window, window_bounds
+lazy from .instructions import decode, span_facts
 
 
 def now() -> str:
@@ -288,18 +288,21 @@ def capture_targets(
 
 
 def write_capture(path: Path, capture: dict, overwrite: bool = False) -> None:
+    write_bytes(path, (json.dumps(capture, indent=2, allow_nan=False) + "\n").encode("utf-8"), overwrite)
+
+
+def write_bytes(path: Path, raw: bytes, overwrite: bool = False) -> None:
     # Windows rename refuses an existing destination; POSIX rename would clobber it.
     if os.name != "nt":
-        raise OSError("Saving captures requires Windows no-clobber rename semantics")
+        raise OSError("Saving files requires Windows no-clobber rename semantics")
     path.parent.mkdir(parents=True, exist_ok=True)
     file = tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
     )
     temporary = Path(file.name)
     try:
         with file:
-            json.dump(capture, file, indent=2, allow_nan=False)
-            file.write("\n")
+            file.write(raw)
         if overwrite:
             temporary.replace(path)
         else:

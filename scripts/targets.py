@@ -79,7 +79,7 @@ class Target:
 
 def load_target_list(path: Path, groups: list[str] | None = None) -> tuple[dict, list[Target]]:
     raw = path.read_bytes()
-    payload = json.loads(raw.decode("utf-8"))
+    payload = json.loads(raw)
     if not isinstance(payload, dict) or not isinstance(payload.get("targets"), list):
         raise ValueError("Target list must be an object containing a targets array")
     targets = []

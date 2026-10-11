@@ -7,7 +7,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from support import write_pe
+from support import BASE, ok_result, saved_capture, write_pe
 
 from scripts.__main__ import main
 
@@ -54,7 +54,7 @@ class CliTests(unittest.TestCase):
                     ],
                 }
             ),
-            encoding="utf-8",
+            encoding="utf-8-sig",
         )
         destination = self.root / "capture.json"
         status, output, errors = self.run_cli(
@@ -80,7 +80,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(captured["request"]["groups"], ["code"])
         self.assertEqual(captured["summary"]["target_count"], 1)
         left = self.root / "inspected.json"
-        left.write_text(json.dumps(inspected), encoding="utf-8")
+        left.write_text(json.dumps(inspected), encoding="utf-8-sig")
         status, output, errors = self.run_cli("compare", left, destination)
         self.assertEqual((status, errors), (0, ""))
         self.assertTrue(json.loads(output)["comparisons"][0]["windows_equal"])
@@ -110,6 +110,131 @@ class CliTests(unittest.TestCase):
         self.assertIn("decoder failed", errors)
         self.assertEqual(output.strip(), str(destination.resolve()))
         self.assertEqual(json.loads(destination.read_text())["results"][0]["read"]["bytes_hex"], "90C3")
+        exported = self.root / "decoded-failed.bin"
+        status, output, errors = self.run_cli("export", destination, "--label", "site", "--output", exported)
+        self.assertEqual((status, errors), (0, ""))
+        self.assertEqual(exported.read_bytes(), b"\x90\xc3")
+
+    def test_export_preserves_the_whole_saved_window(self):
+        write_pe(self.image, b"\x90\xc3\x0f")
+        status, output, errors = self.run_cli(
+            "inspect",
+            "--file",
+            self.image,
+            "--rva",
+            "0x1001",
+            "--before",
+            1,
+            "--after",
+            1,
+            "--format",
+            "json",
+        )
+        self.assertEqual((status, errors), (0, ""))
+        capture = self.root / "capture.json"
+        capture.write_text(output, encoding="utf-16")
+        self.image.unlink()
+        destination = self.root / "code.bin"
+        status, output, errors = self.run_cli("export", capture, "--label", "site", "--output", destination)
+        self.assertEqual((status, errors), (0, ""))
+        report = json.loads(output)
+        self.assertEqual(destination.read_bytes(), b"\x90\xc3\x0f")
+        self.assertEqual(report["start_va"], hex(BASE + 0x1000))
+        self.assertEqual((report["module_base"], report["module_size"]), (hex(BASE), 0x2000))
+        self.assertEqual(report["byte_count"], 3)
+        self.assertEqual(report["output"], str(destination.resolve()))
+
+    def test_export_handles_private_va_pointer_cells_and_clipped_windows(self):
+        pointer = bytes(range(8))
+        cases = [
+            ({"label": "site", "va": "0x123001"}, {"start_va": "0x123000"}, b"\x90\xc3\x0f", 1, 1, 0x123000),
+            (
+                {"label": "site", "rva": "0x1000", "kind": "pointer"},
+                {"start_rva": "0x1000"},
+                pointer,
+                32,
+                64,
+                BASE + 0x1000,
+            ),
+            ({"label": "site", "rva": "0x0"}, {"start_rva": "0x0"}, b"\x90" * 65, 32, 64, BASE),
+        ]
+        capture, destination = self.root / "capture.json", self.root / "range.bin"
+        for target, address, raw, before, after, start in cases:
+            with self.subTest(target=target):
+                result = {"target": target, "read": {"status": "ok", "bytes_hex": raw.hex(), **address}}
+                capture.write_text(json.dumps(saved_capture([result], before=before, after=after)))
+                status, output, errors = self.run_cli(
+                    "export",
+                    capture,
+                    "--label",
+                    "site",
+                    "--output",
+                    destination,
+                    "--overwrite",
+                )
+                self.assertEqual((status, errors), (0, ""))
+                report = json.loads(output)
+                self.assertEqual(destination.read_bytes(), raw)
+                self.assertEqual(report["start_va"], hex(start))
+                self.assertEqual(report["byte_count"], len(raw))
+                self.assertEqual("module_base" in report, "rva" in target)
+
+    def test_export_failures_have_no_stdout_and_preserve_existing_files(self):
+        capture, destination = self.root / "capture.json", self.root / "range.bin"
+        payload = saved_capture(
+            [
+                ok_result("site", b"\x90\xc3"),
+                {
+                    "target": {"label": "failed", "rva": "0x1000"},
+                    "read": {"status": "error", "error": {"message": "unreadable"}},
+                },
+            ]
+        )
+        capture.write_text(json.dumps(payload))
+        destination.write_bytes(b"existing bytes")
+        command = ("export", capture, "--output", destination, "--overwrite")
+        for label in ("absent", "failed"):
+            with self.subTest(label=label):
+                status, output, errors = self.run_cli(*command, "--label", label)
+                self.assertEqual((status, output), (1, ""))
+                self.assertIn(label, errors)
+                self.assertEqual(destination.read_bytes(), b"existing bytes")
+        payload["results"][0]["read"]["bytes_hex"] = "90"
+        capture.write_text(json.dumps(payload))
+        status, output, errors = self.run_cli(*command, "--label", "site")
+        self.assertEqual((status, output), (1, ""))
+        self.assertIn("Invalid capture", errors)
+        self.assertEqual(destination.read_bytes(), b"existing bytes")
+
+    def test_export_requires_overwrite_and_never_replaces_its_input(self):
+        capture, destination = self.root / "capture.json", self.root / "range.bin"
+        capture.write_text(json.dumps(saved_capture([ok_result("site", b"\x90\xc3")])))
+        original = capture.read_bytes()
+        command = ("export", capture, "--label", "site", "--output", destination)
+        destination.write_bytes(b"existing bytes")
+        status, output, errors = self.run_cli(*command)
+        self.assertEqual((status, output), (1, ""))
+        self.assertEqual(destination.read_bytes(), b"existing bytes")
+        status, output, errors = self.run_cli(*command, "--overwrite")
+        self.assertEqual((status, errors), (0, ""))
+        self.assertEqual(destination.read_bytes(), b"\x90\xc3")
+        alias = self.root / "alias.json"
+        alias.hardlink_to(capture)
+        for output_path in (capture, alias):
+            with self.subTest(output_path=output_path):
+                status, output, errors = self.run_cli(
+                    "export",
+                    capture,
+                    "--label",
+                    "site",
+                    "--output",
+                    output_path,
+                    "--overwrite",
+                )
+                self.assertEqual((status, output), (1, ""))
+                self.assertIn("must not be the input capture", errors)
+                self.assertEqual(capture.read_bytes(), original)
+        self.assertFalse(list(self.root.glob("*.tmp")))
 
     def test_text_inspection_derives_instruction_markers_and_undecoded_tail(self):
         write_pe(self.image, bytes.fromhex("01 FF 15 E0 67 ED FF 45 33 C0"))

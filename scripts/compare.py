@@ -4,7 +4,16 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .targets import PATCH_STATES, Target, absolute_window, integer, text, validate_window, window_bounds
+from .targets import (
+    ADDRESS_LIMIT,
+    PATCH_STATES,
+    Target,
+    absolute_window,
+    integer,
+    text,
+    validate_window,
+    window_bounds,
+)
 
 
 @dataclass(frozen=True)
@@ -35,7 +44,7 @@ class Record:
 def load_capture(path: Path) -> tuple[dict, list[Record]]:
     """Read captured bytes without relying on disassembly or summary counts."""
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_bytes())
         if not isinstance(payload, dict):
             raise ValueError("Top-level capture must be a JSON object")
         source = payload.get("source")
@@ -60,8 +69,8 @@ def load_capture(path: Path) -> tuple[dict, list[Record]]:
         text(module.get("path"), "source.module.path")
         base = integer(module.get("base_address"), "source.module.base_address")
         size = integer(module.get("image_size"), "source.module.image_size")
-        if size == 0:
-            raise ValueError("source.module.image_size must be positive")
+        if size == 0 or base + size > ADDRESS_LIMIT:
+            raise ValueError("Invalid source.module address bounds")
         if kind == "live_process":
             process = source.get("process")
             if not isinstance(process, dict):

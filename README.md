@@ -25,6 +25,7 @@ Live reads are sequential rather than an atomic snapshot; failed reads are recor
 |---|---|---|
 | `inspect` | One address in a PE file or running process | Bytes and disassembly or pointer values; text or JSON |
 | `capture` | A target list and a PE file or running process | One saved JSON capture for the selected targets |
+| `export` | A saved capture and target label | A raw byte file and its original starting address |
 | `compare` | Two saved captures | Byte differences, coverage, and labels present in only one capture |
 
 For a before/after check, capture the same labeled sites in each setup, then compare the saved files.

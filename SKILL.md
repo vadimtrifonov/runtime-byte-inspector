@@ -1,6 +1,6 @@
 ---
 name: runtime-byte-inspector
-description: Inspect and disassemble AMD64 byte ranges from Windows processes or PE files, and compare saved captures.
+description: Inspect and disassemble AMD64 byte ranges from Windows processes or PE files; compare saved captures and export their bytes.
 ---
 
 # Runtime Byte Inspector
@@ -126,6 +126,24 @@ Live locations report module/RVA or allocation/protection details.
 Module associations use the inventory taken when the process is opened (`source.module_inventory_at`).
 Addresses are `0x`-prefixed strings, counts are integers, and byte strings are packed hexadecimal.
 
+## Export saved bytes
+
+```powershell
+mise run inspector -- export "$env:TEMP\capture.json" --label function-entry `
+  --output "$env:TEMP\code.bin"
+```
+
+Use the exact target label; `inspect --format json` uses `site`.
+Exports one target's complete primary read, including bytes before the target and after the decoded block; the first byte can be mid-instruction.
+A pointer target exports its 8-byte cell.
+Embedded pointer reads and `follow.hops` are not exported.
+
+stdout is JSON with the output path, byte count, and `start_va` of the first exported byte.
+RVA targets also report `module_base` and `module_size`.
+
+The selected read must have succeeded; decoding failures do not prevent export.
+Replacing an existing destination requires `--overwrite`.
+
 ## Compare saved captures
 
 Matching labels are paired by default; unmatched labels are reported separately.
@@ -156,11 +174,12 @@ Difference offsets and overlap bounds use the selected alignment; end bounds are
 |---|---|
 | `inspect` | Text by default; `--format json` emits a single-target capture |
 | `capture` | Absolute path to the saved JSON capture |
+| `export` | JSON with the exported file path and address information |
 | `compare` | JSON report by default; `--format text` selects text |
 
 Diagnostics use stderr.
 Invalid input, source-access failures, and publication failures return nonzero.
-Read, location-query, and decoding errors also return nonzero, including errors in supporting reads.
+`inspect` and `capture` also return nonzero for read, location-query, and decoding errors, including errors in supporting reads.
 Successful reads remain available in the output, and `capture` still saves the results.
 Incomplete decoding, unresolved register-dependent targets, and normal following limits are not command failures.
 

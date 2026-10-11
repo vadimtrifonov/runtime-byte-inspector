@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from support import ok_result, saved_capture
+from support import BASE, ok_result, saved_capture
 
 from scripts.compare import Record, compare_captures, compare_records, load_capture, render_report
 
@@ -150,14 +150,18 @@ class ComparisonTests(unittest.TestCase):
             ("read", "bytes_hex", "90"),
             ("read", "bytes_hex", "ZZ"),
             ("read", "start_rva", "0x1001"),
+            ("read", "start_va", hex(BASE + 0x1001)),
             ("target", "rva", True),
+            ("target", "kind", "unknown"),
         ):
             case = copy.deepcopy(original)
             case["results"][0][section][key] = value
             cases.append(case)
         duplicate = copy.deepcopy(original)
         duplicate["results"].append(duplicate["results"][0])
-        cases.extend([duplicate, {"records": []}])
+        overflow = copy.deepcopy(original)
+        overflow["source"]["module"]["base_address"] = hex((1 << 64) - 1)
+        cases.extend([duplicate, overflow, {"records": []}])
         for case in cases:
             with self.subTest(case=case):
                 path = self.save("bad.json", case)

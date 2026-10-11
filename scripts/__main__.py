@@ -5,11 +5,12 @@ import json
 import sys
 from pathlib import Path
 
-from .capture import capture_targets, iter_errors, write_capture
-from .compare import compare_captures, render_report
-from .pe import PeImage
 from .render import render_inspection
 from .targets import MAX_FOLLOW_HOPS, PATCH_STATES, Target, integer, load_target_list, validate_window
+lazy from .capture import capture_targets, iter_errors, write_capture
+lazy from .compare import compare_captures, render_report
+lazy from .export import export_capture
+lazy from .pe import PeImage
 
 
 def address(value: str) -> int:
@@ -18,7 +19,7 @@ def address(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="runtime-byte-inspector", description="Inspect and compare bounded AMD64 byte captures"
+        prog="runtime-byte-inspector", description="Inspect, export, and compare bounded AMD64 byte captures"
     )
     commands = parser.add_subparsers(dest="command", required=True)
     inspect = commands.add_parser("inspect", help="Print one PE or live-process byte window")
@@ -85,6 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Align module RVAs or offsets from targets; VA targets require target alignment",
     )
     compare.add_argument("--format", choices=("text", "json"), default="json")
+    export = commands.add_parser("export", help="Export one saved primary read as a raw byte file")
+    export.add_argument("capture", type=Path, help="Saved JSON capture")
+    export.add_argument("--label", required=True, help="Exact target label")
+    export.add_argument("--output", type=Path, required=True, help="Destination raw byte file")
+    export.add_argument("--overwrite", action="store_true", help="Replace an existing destination")
     return parser
 
 
@@ -108,6 +114,10 @@ def report_capture_errors(capture: dict) -> bool:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "export":
+            report = export_capture(args.capture, args.label, args.output, args.overwrite)
+            print(json.dumps(report, indent=2))
+            return 0
         if args.command == "compare":
             report = compare_captures(
                 args.left,

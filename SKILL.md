@@ -12,8 +12,6 @@ Requires Windows x64.
 
 ```powershell
 mise trust mise.toml
-mise install
-mise run setup
 ```
 
 ## Inspect one target
